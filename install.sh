@@ -1,5 +1,5 @@
 #!/bin/sh
-# Dynamo bootstrap script: v0.1.9
+# Dynamo bootstrap script: v0.1.10-alpha1
 echo "Setup script ran at $(date)"
 
 sudo apt-get update -y
