@@ -2,12 +2,28 @@
 # Dynamo bootstrap script: v0.1.10-alpha2
 echo "Setup script ran at $(date)"
 
+# Detect WSL environment (check kernel version string set by WSL)
+IS_WSL=false
+if grep -qi microsoft /proc/version 2>/dev/null; then
+  IS_WSL=true
+  echo "WSL environment detected"
+fi
+
 sudo apt-get update -y
 sudo apt-get install -y \
   jq curl gnupg lsb-release libarchive-tools \
   || { echo "failed to install dependent packages"; exit 1; }
-command -v docker >/dev/null 2>&1 \
-  || { sudo apt update && sudo apt install -y docker.io; }
+if ! command -v docker >/dev/null 2>&1; then
+  sudo install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+    sudo gpg --dearmor --batch --yes -o /etc/apt/keyrings/docker.gpg
+  sudo chmod a+r /etc/apt/keyrings/docker.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+    https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | \
+    sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+  sudo apt-get update
+  sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+fi
 sudo systemctl enable docker
 sudo systemctl start docker
 
@@ -40,7 +56,14 @@ sudo usermod -aG docker "$SERVICE_USER"
 sudo chown -R ${SERVICE_USER}:${SERVICE_USER} "${INSTALL_ROOT}"
 [ -d "${INSTALL_ROOT}/docker" ] || mkdir "${INSTALL_ROOT}/docker"
 
-if lspci | grep -i nvidia; then
+HAS_NVIDIA_GPU=false
+if [ "$IS_WSL" = true ]; then
+  /usr/lib/wsl/lib/nvidia-smi >/dev/null 2>&1 && HAS_NVIDIA_GPU=true
+else
+  lspci 2>/dev/null | grep -qi nvidia && HAS_NVIDIA_GPU=true
+fi
+
+if [ "$HAS_NVIDIA_GPU" = true ]; then
   echo "NVIDIA GPU detected. Installing NVIDIA Container Toolkit..."
   curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
     sudo gpg --dearmor --batch --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
@@ -137,28 +160,32 @@ REGION="unknown"
 ZONE="unknown"
 CSP="unknown"
 
-FETCHERS="try_fetch_aws:aws try_fetch_azure:azure"
+if [ "$IS_WSL" = true ]; then
+  CSP="wsl"
+else
+  FETCHERS="try_fetch_aws:aws try_fetch_azure:azure"
 
-for entry in $FETCHERS; do
-  func=${entry%%:*}
-  name=${entry#*:}
+  for entry in $FETCHERS; do
+    func=${entry%%:*}
+    name=${entry#*:}
 
-  result=$($func 2>/dev/null) || continue
-  case $result in
-    *"|"*)
-      REGION=${result%%|*}
-      ZONE=${result#*|}
-      ;;
-    *)
-      continue
-      ;;
-  esac
+    result=$($func 2>/dev/null) || continue
+    case $result in
+      *"|"*)
+        REGION=${result%%|*}
+        ZONE=${result#*|}
+        ;;
+      *)
+        continue
+        ;;
+    esac
 
-  if [ -n "$REGION" ]; then
-    CSP=$name
-    break
-  fi
-done
+    if [ -n "$REGION" ]; then
+      CSP=$name
+      break
+    fi
+  done
+fi
 
 jq \
   --arg csp "$CSP" \
