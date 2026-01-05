@@ -4,7 +4,7 @@ echo "Setup script ran at $(date)"
 
 # Detect WSL environment (check kernel version string set by WSL)
 IS_WSL=false
-if grep -qi microsoft /proc/version 2>/dev/null; then
+if grep -q microsoft-standard-WSL2 /proc/version 2>/dev/null; then
   IS_WSL=true
   echo "WSL environment detected"
 fi
@@ -160,32 +160,28 @@ REGION="unknown"
 ZONE="unknown"
 CSP="unknown"
 
-if [ "$IS_WSL" = true ]; then
-  CSP="wsl"
-else
-  FETCHERS="try_fetch_aws:aws try_fetch_azure:azure"
+FETCHERS="try_fetch_aws:aws try_fetch_azure:azure"
 
-  for entry in $FETCHERS; do
-    func=${entry%%:*}
-    name=${entry#*:}
+for entry in $FETCHERS; do
+  func=${entry%%:*}
+  name=${entry#*:}
 
-    result=$($func 2>/dev/null) || continue
-    case $result in
-      *"|"*)
-        REGION=${result%%|*}
-        ZONE=${result#*|}
-        ;;
-      *)
-        continue
-        ;;
-    esac
+  result=$($func 2>/dev/null) || continue
+  case $result in
+    *"|"*)
+      REGION=${result%%|*}
+      ZONE=${result#*|}
+      ;;
+    *)
+      continue
+      ;;
+  esac
 
-    if [ -n "$REGION" ]; then
-      CSP=$name
-      break
-    fi
-  done
-fi
+  if [ -n "$REGION" ]; then
+    CSP=$name
+    break
+  fi
+done
 
 jq \
   --arg csp "$CSP" \
