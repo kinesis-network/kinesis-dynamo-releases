@@ -219,14 +219,14 @@ jq \
 if [ -n "${OWNER_GUID:-}" ]; then
   tmp="$(mktemp)"
   jq --arg owner_guid "$OWNER_GUID" \
-     '.owner_guid = $owner_guid' \
+     '.authz_owner_guid = $owner_guid' \
      "$CONFIG_PATH.tmp" > "$tmp"
   mv "$tmp" "$CONFIG_PATH.tmp"
 fi
 
 if [ -n "${IS_PRIVATE:-}" ]; then
   tmp="$(mktemp)"
-  jq '.is_private = true' \
+  jq '.authz_is_private = true' \
      "$CONFIG_PATH.tmp" > "$tmp"
   mv "$tmp" "$CONFIG_PATH.tmp"
 fi
