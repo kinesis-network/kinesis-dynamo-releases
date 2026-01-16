@@ -1,5 +1,5 @@
 #!/bin/sh
-# Dynamo bootstrap script: v0.1.10-beta2
+# Dynamo bootstrap script: v0.1.10
 echo "Setup script ran at $(date)"
 
 # Detect WSL environment (check kernel version string set by WSL)
@@ -156,11 +156,31 @@ try_fetch_azure() {
   printf '%s|%s\n' "$region" "$zone"
 }
 
+try_fetch_hyperstack() {
+  md="http://169.254.169.254"
+  region=""
+  zone=""
+
+  # Try the OpenStack metadata endpoint which returns JSON
+  meta_json=$(curl -fsS --max-time 1 \
+    "$md/openstack/latest/meta_data.json" 2>/dev/null) || return 1
+
+  [ -z "$meta_json" ] && return 1
+
+  # Extract availability_zone from the JSON response
+  zone=$(echo "$meta_json" | jq -r '.availability_zone // empty' 2>/dev/null)
+  [ -z "$zone" ] && return 1
+
+  region="$zone"
+
+  printf '%s|%s\n' "$region" "$zone"
+}
+
 REGION="unknown"
 ZONE="unknown"
 CSP="unknown"
 
-FETCHERS="try_fetch_aws:aws try_fetch_azure:azure"
+FETCHERS="try_fetch_hyperstack:hyperstack try_fetch_aws:aws try_fetch_azure:azure"
 
 for entry in $FETCHERS; do
   func=${entry%%:*}
