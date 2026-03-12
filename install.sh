@@ -1,5 +1,5 @@
 #!/bin/sh
-# Dynamo bootstrap script: v0.1.18-alpha1
+# Dynamo bootstrap script: v0.1.18
 echo "Setup script ran at $(date)"
 
 # Detect WSL environment (check kernel version string set by WSL)
@@ -30,6 +30,13 @@ sudo systemctl start docker
 # These placeholder strings will be replaced by Kinesis Cloud
 # to pass this script to EC2 as user data
 NODE_PROVISION_GUID=${NODE_PROVISION_GUID:-"INSTANCE_PROVISION_GUID_PLACEHOLDER"}
+IS_PRIVATE=${IS_PRIVATE:-"IS_PRIVATE_PLACEHOLDER"}
+OWNER_GUID=${OWNER_GUID:-"OWNER_GUID_PLACEHOLDER"}
+
+# Clear any placeholders that Kinesis Cloud didn't replace
+case "$NODE_PROVISION_GUID" in *PLACEHOLDER*) NODE_PROVISION_GUID="" ;; esac
+case "$IS_PRIVATE" in *PLACEHOLDER*) IS_PRIVATE="" ;; esac
+case "$OWNER_GUID" in *PLACEHOLDER*) OWNER_GUID="" ;; esac
 
 RELEASE_VERSION=${RELEASE_VERSION:-"latest"}
 PUBLIC_IP=${PUBLIC_IP:-""}
