@@ -1,5 +1,5 @@
 #!/bin/sh
-# Dynamo bootstrap script: v0.1.20
+# Dynamo bootstrap script: v0.1.21-beta1
 echo "Setup script ran at $(date)"
 
 # Detect WSL environment (check kernel version string set by WSL)
@@ -59,6 +59,7 @@ case "${OS_ARCH}" in
 esac
 
 sudo usermod -aG docker "$SERVICE_USER"
+sudo usermod -aG systemd-journal "$SERVICE_USER"
 [ -d ${INSTALL_ROOT} ] || sudo mkdir -p "${INSTALL_ROOT}"
 sudo chown -R ${SERVICE_USER}:${SERVICE_USER} "${INSTALL_ROOT}"
 [ -d "${INSTALL_ROOT}/docker" ] || mkdir "${INSTALL_ROOT}/docker"
