@@ -1,5 +1,5 @@
 #!/bin/sh
-# Dynamo bootstrap script: v0.1.23
+# Dynamo bootstrap script: v0.1.24-alpha1
 echo "Setup script ran at $(date)"
 
 # Detect WSL environment (check kernel version string set by WSL)
