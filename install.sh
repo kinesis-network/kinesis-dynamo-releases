@@ -1,5 +1,5 @@
 #!/bin/sh
-# Dynamo bootstrap script: v0.1.24
+# Dynamo bootstrap script: v0.1.25
 echo "Setup script ran at $(date)"
 
 # Detect WSL environment (check kernel version string set by WSL)
@@ -245,16 +245,20 @@ sed -i 's/User=ubuntu/User='${SERVICE_USER}'/' ${INSTALL_ROOT}/dynamo.service
 sed -i 's/User=ubuntu/User='${SERVICE_USER}'/' ${INSTALL_ROOT}/dynamo-admin.service
 sed -i 's|/opt/dynamo/|'${INSTALL_ROOT}/'|g' ${INSTALL_ROOT}/dynamo.service
 sed -i 's|/opt/dynamo/|'${INSTALL_ROOT}/'|g' ${INSTALL_ROOT}/dynamo-admin.service
+sed -i 's|/opt/dynamo/|'${INSTALL_ROOT}/'|g' ${INSTALL_ROOT}/dynamo-ecc-enforcer.service
 sed -i 's|/opt/dynamo/|'${INSTALL_ROOT}/'|g' ${CONFIG_PATH}
 
 sudo cp ${INSTALL_ROOT}/dynamo.service /etc/systemd/system/
 sudo cp ${INSTALL_ROOT}/dynamo-admin.service /etc/systemd/system/
+sudo cp ${INSTALL_ROOT}/dynamo-ecc-enforcer.service /etc/systemd/system/
 
 sudo systemctl daemon-reload
 
 sudo systemctl enable dynamo.service
 sudo systemctl enable dynamo-admin.service
+sudo systemctl enable dynamo-ecc-enforcer.service
 
+sudo systemctl start dynamo-ecc-enforcer.service
 sudo systemctl start dynamo.service
 sudo systemctl start dynamo-admin.service
 
