@@ -1,5 +1,5 @@
 #!/bin/bash
-# Kinesis Dynamo Bootstrap Script: v0.2.0-alpha2
+# Kinesis Dynamo Bootstrap Script: v0.2.0-alpha3
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -147,11 +147,17 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now dynamo.service dynamo-admin.service dynamo-ecc-enforcer.service
 
 # --- 9. Verification ---
-echo "[*] Verifying installation..."
-sleep 1
-if sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --version --config="$CONFIG_PATH" > /dev/null; then
-    echo "--- [OK] Kinesis Dynamo installed successfully at $INSTALL_ROOT ---"
-else
-    echo "--- [FAIL] Installation verification failed ---"
+output=$(sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --version --config="$CONFIG_PATH")
+rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo "[FAIL] Dynamo installation failed"
     exit 1
 fi
+
+echo
+echo "[OK] dynamo has been successfully installed."
+echo
+echo "Install directory: ${INSTALL_ROOT}"
+echo "Config file: ${CONFIG_PATH}"
+echo "Service user: ${SERVICE_USER}"
+echo "${output}"
