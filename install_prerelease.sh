@@ -147,7 +147,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now dynamo.service dynamo-admin.service dynamo-ecc-enforcer.service
 
 # --- 9. Verification ---
-output=$(sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --version --config="$CONFIG_PATH")
+output=$(sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --version --config="$CONFIG_PATH" 2>/dev/null)
 rc=$?
 if [ "$rc" -ne 0 ]; then
     echo "[FAIL] Dynamo installation failed"
