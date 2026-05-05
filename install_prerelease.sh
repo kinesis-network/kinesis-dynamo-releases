@@ -1,5 +1,5 @@
 #!/bin/bash
-# Kinesis Dynamo Bootstrap Script: v0.2.0-beta2
+# Kinesis Dynamo Bootstrap Script: v0.2.0-beta3
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -107,14 +107,19 @@ sudo rm /tmp/dynamo.zip
 # --- 6. Cloud Metadata (Simplified) ---
 echo "[*] Detecting Cloud Provider..."
 CSP="manual"; REGION="unknown"; ZONE="unknown"
+# Define common curl timeout settings
+# --connect-timeout: max time to wait for connection
+# -m, --max-time: max time for the whole operation
+TIMEOUT_FLAGS="--connect-timeout 2 --max-time 3"
 # AWS IMDSv2
-if TOKEN=$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null); then
-    ZONE=$(curl -fsS -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/placement/availability-zone")
+if TOKEN=$(curl $TIMEOUT_FLAGS -fsS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null); then
+    ZONE=$(curl $TIMEOUT_FLAGS -fsS -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/placement/availability-zone")
     REGION="${ZONE%[a-z]}"; CSP="aws"
 # Azure
-elif REGION=$(curl -fsS -H "Metadata: true" "http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text" 2>/dev/null); then
-    CSP="azure"; ZONE=$(curl -fsS -H "Metadata: true" "http://169.254.169.254/metadata/instance/compute/zone?api-version=2021-02-01&format=text" 2>/dev/null || echo "1")
+elif REGION=$(curl $TIMEOUT_FLAGS -fsS -H "Metadata: true" "http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text" 2>/dev/null); then
+    CSP="azure"; ZONE=$(curl $TIMEOUT_FLAGS -fsS -H "Metadata: true" "http://169.254.169.254/metadata/instance/compute/zone?api-version=2021-02-01&format=text" 2>/dev/null || echo "1")
 fi
+echo "[*] Provider: $CSP ($REGION / $ZONE)"
 
 # --- 7. Initialization & Config ---
 echo "[*] Checking for existing wallet..."
