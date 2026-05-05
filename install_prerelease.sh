@@ -1,5 +1,5 @@
 #!/bin/bash
-# Kinesis Dynamo Bootstrap Script: v0.2.0-beta1
+# Kinesis Dynamo Bootstrap Script: v0.2.0-beta2
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -116,12 +116,21 @@ elif REGION=$(curl -fsS -H "Metadata: true" "http://169.254.169.254/metadata/ins
     CSP="azure"; ZONE=$(curl -fsS -H "Metadata: true" "http://169.254.169.254/metadata/instance/compute/zone?api-version=2021-02-01&format=text" 2>/dev/null || echo "1")
 fi
 
-# Only run init if the node hasn't been provisioned yet
-if [ ! -f "$INSTALL_ROOT/node.key" ]; then
+# --- 7. Initialization & Config ---
+echo "[*] Checking for existing wallet..."
+SHOULD_INIT=true
+if [ -f "$CONFIG_PATH" ]; then
+    # Extract the wallet path from the existing config
+    WALLET_FILE=$(sudo -u "$SERVICE_USER" jq -r '.key_manager.wallet_file // empty' "$CONFIG_PATH")
+    if [ -n "$WALLET_FILE" ] && [ -f "$WALLET_FILE" ]; then
+        echo "[*] Wallet detected at $WALLET_FILE. Skipping --init."
+        SHOULD_INIT=false
+    fi
+fi
+
+if [ "$SHOULD_INIT" = true ]; then
     echo "[*] Running gRPC initialization..."
     sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}"
-else
-    echo "[*] Node already initialized (node.key found). Skipping --init."
 fi
 
 echo "[*] Patching configuration..."
