@@ -1,5 +1,5 @@
 #!/bin/bash
-# Kinesis Dynamo Bootstrap Script: v0.2.0-beta6
+# Kinesis Dynamo Bootstrap Script: v0.2.0-beta7
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -7,6 +7,7 @@ echo "--- Kinesis Dynamo Setup started at $(date) ---"
 # --- 1. Configuration & Placeholders ---
 # These are replaced during deployment or set via environment
 PROVISION_TOKEN=${PROVISION_TOKEN:-"TOKEN_PLACEHOLDER"}
+UNIVERSE=${UNIVERSE:-"production"}
 RELEASE_VERSION=${RELEASE_VERSION:-"latest"}
 INSTALL_ROOT=${INSTALL_ROOT:-"/opt/dynamo"}
 SERVICE_USER=${SERVICE_USER:-"$USER"}
@@ -27,6 +28,7 @@ case "${OS_ARCH}" in
 esac
 
 echo "PROVISION_TOKEN=$PROVISION_TOKEN"
+echo "UNIVERSE=$UNIVERSE"
 echo "RELEASE_VERSION=$RELEASE_VERSION"
 echo "INSTALL_ROOT=$INSTALL_ROOT"
 echo "SERVICE_USER=$SERVICE_USER"
@@ -135,7 +137,7 @@ fi
 
 if [ "$SHOULD_INIT" = true ]; then
     echo "[*] Running gRPC initialization..."
-    sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}"
+    sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}"
 fi
 
 echo "[*] Patching configuration..."
