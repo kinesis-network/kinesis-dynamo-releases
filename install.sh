@@ -1,271 +1,173 @@
-#!/bin/sh
-# Dynamo bootstrap script: v0.1.26
-echo "Setup script ran at $(date)"
+#!/bin/bash
+# Kinesis Dynamo Bootstrap Script: v0.2.0
+set -e # Exit on error
 
-# Detect WSL environment (check kernel version string set by WSL)
+echo "--- Kinesis Dynamo Setup started at $(date) ---"
+
+# --- 1. Configuration & Placeholders ---
+# These are replaced during deployment or set via environment
+PROVISION_TOKEN=${PROVISION_TOKEN:-"TOKEN_PLACEHOLDER"}
+UNIVERSE=${UNIVERSE:-"production"}
+RELEASE_VERSION=${RELEASE_VERSION:-"latest"}
+INSTALL_ROOT=${INSTALL_ROOT:-"/opt/dynamo"}
+SERVICE_USER=${SERVICE_USER:-"$USER"}
+CONFIG_PATH="$INSTALL_ROOT/config.json"
+
+# --- 2. Environment Detection ---
 IS_WSL=false
 if grep -q microsoft-standard-WSL2 /proc/version 2>/dev/null; then
-  IS_WSL=true
-  echo "WSL environment detected"
+    IS_WSL=true
+    echo "[*] WSL2 environment detected"
 fi
-
-sudo apt-get update -y
-sudo apt-get install -y \
-  jq curl gnupg lsb-release libarchive-tools \
-  || { echo "failed to install dependent packages"; exit 1; }
-if ! command -v docker >/dev/null 2>&1; then
-  sudo install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
-    sudo gpg --dearmor --batch --yes -o /etc/apt/keyrings/docker.gpg
-  sudo chmod a+r /etc/apt/keyrings/docker.gpg
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-    https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | \
-    sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-  sudo apt-get update
-  sudo apt-get install -y docker-ce docker-ce-cli containerd.io
-fi
-sudo systemctl enable docker
-sudo systemctl start docker
-
-# These placeholder strings will be replaced by Kinesis Cloud
-# to pass this script to EC2 as user data
-NODE_PROVISION_GUID=${NODE_PROVISION_GUID:-"INSTANCE_PROVISION_GUID_PLACEHOLDER"}
-IS_PRIVATE=${IS_PRIVATE:-"IS_PRIVATE_PLACEHOLDER"}
-OWNER_GUID=${OWNER_GUID:-"OWNER_GUID_PLACEHOLDER"}
-
-# Clear any placeholders that Kinesis Cloud didn't replace
-case "$NODE_PROVISION_GUID" in *PLACEHOLDER*) NODE_PROVISION_GUID="" ;; esac
-case "$IS_PRIVATE" in *PLACEHOLDER*) IS_PRIVATE="" ;; esac
-case "$OWNER_GUID" in *PLACEHOLDER*) OWNER_GUID="" ;; esac
-
-RELEASE_VERSION=${RELEASE_VERSION:-"latest"}
-PUBLIC_IP=${PUBLIC_IP:-""}
-INSTALL_ROOT=${INSTALL_ROOT:-"/opt/dynamo"}
-SERVICE_USER=${SERVICE_USER:-"${USER}"}
-CONFIG_PATH="$INSTALL_ROOT/config.json"
 
 OS_ARCH=$(uname -m)
 case "${OS_ARCH}" in
-  x86_64)
-    OS_ARCH=linux-amd64
-    ;;
-  aarch64 | arm64)
-    OS_ARCH=linux-arm64
-    ;;
-  *)
-    echo "Unsupported architecture: ${OS_ARCH}" >&2
-    exit 1
-    ;;
+    x86_64) OS_ARCH=linux-amd64 ;;
+    aarch64|arm64) OS_ARCH=linux-arm64 ;;
+    *) echo "Unsupported architecture: ${OS_ARCH}"; exit 1 ;;
 esac
 
+echo "PROVISION_TOKEN=$PROVISION_TOKEN"
+echo "UNIVERSE=$UNIVERSE"
+echo "RELEASE_VERSION=$RELEASE_VERSION"
+echo "INSTALL_ROOT=$INSTALL_ROOT"
+echo "SERVICE_USER=$SERVICE_USER"
+echo "CONFIG_PATH=$CONFIG_PATH"
+echo "IS_WSL=$IS_WSL"
+echo "OS_ARCH=$OS_ARCH"
+
+# --- 3. Install Core Dependencies ---
+echo "[*] Installing system dependencies..."
+sudo apt-get update -y
+sudo apt-get install -y jq curl gnupg lsb-release libarchive-tools pciutils
+
+# Docker Setup
+if ! command -v docker >/dev/null 2>&1; then
+    echo "[*] Installing Docker..."
+    sudo install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor --batch --yes -o /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | \
+        sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+    sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+fi
+
+sudo systemctl enable --now docker
 sudo usermod -aG docker "$SERVICE_USER"
 sudo usermod -aG systemd-journal "$SERVICE_USER"
-[ -d ${INSTALL_ROOT} ] || sudo mkdir -p "${INSTALL_ROOT}"
-sudo chown -R ${SERVICE_USER}:${SERVICE_USER} "${INSTALL_ROOT}"
-[ -d "${INSTALL_ROOT}/docker" ] || mkdir "${INSTALL_ROOT}/docker"
 
+# --- 4. GPU Detection & Toolkit ---
 HAS_NVIDIA_GPU=false
 if [ "$IS_WSL" = true ]; then
-  /usr/lib/wsl/lib/nvidia-smi >/dev/null 2>&1 && HAS_NVIDIA_GPU=true
+    [ -f "/usr/lib/wsl/lib/nvidia-smi" ] && HAS_NVIDIA_GPU=true
 else
-  lspci 2>/dev/null | grep -qi nvidia && HAS_NVIDIA_GPU=true
+    lspci | grep -qi nvidia && HAS_NVIDIA_GPU=true
 fi
 
 if [ "$HAS_NVIDIA_GPU" = true ]; then
-  echo "NVIDIA GPU detected. Installing NVIDIA Container Toolkit..."
-  curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
-    sudo gpg --dearmor --batch --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-  curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-  sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-  sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-
-  sudo apt-get update -y
-  NVIDIA_CONTAINER_TOOLKIT_VERSION=$(apt-cache madison nvidia-container-toolkit | head -1 | awk '{print $3}')
-
-  sudo apt-get install -y \
-    nvidia-container-toolkit=$NVIDIA_CONTAINER_TOOLKIT_VERSION \
-    nvidia-container-toolkit-base=$NVIDIA_CONTAINER_TOOLKIT_VERSION \
-    libnvidia-container-tools=$NVIDIA_CONTAINER_TOOLKIT_VERSION \
-    libnvidia-container1=$NVIDIA_CONTAINER_TOOLKIT_VERSION
-  sudo nvidia-ctk runtime configure --runtime=docker
-  sudo systemctl restart docker
-else
-  echo "No NVIDIA GPU found. Skipping NVIDIA toolkit install."
+    echo "[*] NVIDIA GPU detected. Setting up Container Toolkit..."
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor --batch --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+        sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+    sudo nvidia-ctk runtime configure --runtime=docker
+    sudo systemctl restart docker
 fi
 
-REPO_BASE=https://api.github.com/repos/kinesis-network/kinesis-dynamo-releases
-if [ "$RELEASE_VERSION" = "latest" ]; then
-  RELEASE_URL="${REPO_BASE}/releases/latest"
-else
-  RELEASE_URL="${REPO_BASE}/releases/tags/$RELEASE_VERSION"
-fi
-
-echo "Fetching the release package from ${RELEASE_URL}"
-ASSET_URL=$(curl -L -s ${RELEASE_URL} \
-  | jq -r '.assets[] | select(.name | test("dynamo-.*-'${OS_ARCH}'\\.zip$")) | .url'
-)
-echo "Package URL: ${ASSET_URL}"
-
-curl -L \
-  -H "Accept: application/octet-stream" \
-  -o /tmp/dynamo-release.zip \
-  "$ASSET_URL"
-
-if systemctl cat dynamo.service >/dev/null 2>&1; then
-  sudo systemctl stop dynamo
-fi
-if systemctl cat dynamo-admin.service >/dev/null 2>&1; then
-  sudo systemctl stop dynamo-admin
-fi
-
-bsdtar -xf /tmp/dynamo-release.zip --strip-components=1 -C "$INSTALL_ROOT"
-
-try_fetch_aws() {
-  md="http://169.254.169.254"
-  token=""
-  zone=""
-  region=""
-
-  token=$(curl -fsS --max-time 1 -X PUT "$md/latest/api/token" \
-    -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null) || true
-
-  if [ -n "$token" ]; then
-    zone=$(curl -fsS --max-time 1 -H "X-aws-ec2-metadata-token: $token" \
-      "$md/latest/meta-data/placement/availability-zone" 2>/dev/null) || return 1
-  else
-    zone=$(curl -fsS --max-time 1 \
-      "$md/latest/meta-data/placement/availability-zone" 2>/dev/null) || return 1
-  fi
-
-  [ -z "$zone" ] && return 1
-
-  # Region is AZ minus trailing letter (e.g., us-east-1a -> us-east-1)
-  region="${zone%[a-z]}"
-
-  [ -z "$region" ] && return 1
-
-  printf '%s|%s\n' "$region" "$zone"
-}
-
-try_fetch_azure() {
-  base="http://169.254.169.254/metadata/instance/compute"
-  region=""
-  zone=""
-
-  region=$(curl -fsS --max-time 1 -H "Metadata: true" \
-    "$base/location?api-version=2021-02-01&format=text" 2>/dev/null) || return 1
-
-  [ -z "$region" ] && return 1
-
-  # Zone can legitimately be empty; swallow errors and default to empty string
-  zone=$(curl -fsS --max-time 1 -H "Metadata: true" \
-    "$base/zone?api-version=2021-02-01&format=text" 2>/dev/null) || zone=""
-
-  printf '%s|%s\n' "$region" "$zone"
-}
-
-try_fetch_hyperstack() {
-  md="http://169.254.169.254"
-  region=""
-  zone=""
-
-  # Try the OpenStack metadata endpoint which returns JSON
-  meta_json=$(curl -fsS --max-time 1 \
-    "$md/openstack/latest/meta_data.json" 2>/dev/null) || return 1
-
-  [ -z "$meta_json" ] && return 1
-
-  # Extract availability_zone from the JSON response
-  zone=$(echo "$meta_json" | jq -r '.availability_zone // empty' 2>/dev/null)
-  [ -z "$zone" ] && return 1
-
-  region="$zone"
-
-  printf '%s|%s\n' "$region" "$zone"
-}
-
-REGION="unknown"
-ZONE="unknown"
-CSP="unknown"
-
-FETCHERS="try_fetch_hyperstack:hyperstack try_fetch_aws:aws try_fetch_azure:azure"
-
-for entry in $FETCHERS; do
-  func=${entry%%:*}
-  name=${entry#*:}
-
-  result=$($func 2>/dev/null) || continue
-  case $result in
-    *"|"*)
-      REGION=${result%%|*}
-      ZONE=${result#*|}
-      ;;
-    *)
-      continue
-      ;;
-  esac
-
-  if [ -n "$REGION" ]; then
-    CSP=$name
-    break
-  fi
+# --- 4.5 Stop existing services if they exist ---
+echo "[*] Checking for existing services..."
+for svc in dynamo-admin.service dynamo.service dynamo-ecc-enforcer.service; do
+    if systemctl is-active --quiet "$svc"; then
+        echo "[*] Stopping $svc..."
+        sudo systemctl stop "$svc"
+    fi
 done
 
-jq \
-  --arg csp "$CSP" \
-  --arg zone "$ZONE" \
-  --arg region "$REGION" \
-  --arg guid "$NODE_PROVISION_GUID" \
-  --arg public_ip "${PUBLIC_IP}" \
-  '.csp = $csp
-  | .csp_zone = $zone
-  | .csp_region = $region
-  | .public_ip = $public_ip
-  | .provision_guid = $guid' \
-  "$CONFIG_PATH" > "$CONFIG_PATH.tmp"
-
-if [ -n "${OWNER_GUID:-}" ]; then
-  tmp="$(mktemp)"
-  jq --arg owner_guid "$OWNER_GUID" \
-     '.owner_guid = $owner_guid' \
-     "$CONFIG_PATH.tmp" > "$tmp"
-  mv "$tmp" "$CONFIG_PATH.tmp"
+# --- 5. Download & Extract Release ---
+echo "[*] Downloading Kinesis Dynamo (${RELEASE_VERSION})..."
+REPO="kinesis-network/kinesis-dynamo-releases"
+if [ "$RELEASE_VERSION" = "latest" ]; then
+    REL_DATA=$(curl -sL "https://api.github.com/repos/$REPO/releases/latest")
+else
+    REL_DATA=$(curl -sL "https://api.github.com/repos/$REPO/releases/tags/$RELEASE_VERSION")
 fi
 
-if [ -n "${IS_PRIVATE:-}" ]; then
-  tmp="$(mktemp)"
-  jq '.is_private = true' \
-     "$CONFIG_PATH.tmp" > "$tmp"
-  mv "$tmp" "$CONFIG_PATH.tmp"
+# Extract the specific zip URL for the detected architecture
+ASSET_URL=$(echo "$REL_DATA" | jq -r --arg arch "$OS_ARCH" '.assets[] | select(.name | test("dynamo-.*-" + $arch + "\\.zip$")) | .url')
+if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
+    echo "Failed to find a .zip asset for $OS_ARCH in release $RELEASE_VERSION"
+    exit 1
+fi
+echo "[*] Found asset: $ASSET_URL"
+
+sudo mkdir -p "$INSTALL_ROOT/mounts"
+curl -sL -H "Accept: application/octet-stream" -o /tmp/dynamo.zip "$ASSET_URL"
+sudo bsdtar -xvf /tmp/dynamo.zip -C "$INSTALL_ROOT"
+sudo chown -R "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_ROOT"
+sudo rm /tmp/dynamo.zip
+
+# --- 6. Cloud Metadata (Simplified) ---
+echo "[*] Detecting Cloud Provider..."
+CSP="manual"; REGION="unknown"; ZONE="unknown"
+# Define common curl timeout settings
+# --connect-timeout: max time to wait for connection
+# -m, --max-time: max time for the whole operation
+TIMEOUT_FLAGS="--connect-timeout 2 --max-time 3"
+# AWS IMDSv2
+if TOKEN=$(curl $TIMEOUT_FLAGS -fsS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null); then
+    ZONE=$(curl $TIMEOUT_FLAGS -fsS -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/placement/availability-zone")
+    REGION="${ZONE%[a-z]}"; CSP="aws"
+# Azure
+elif REGION=$(curl $TIMEOUT_FLAGS -fsS -H "Metadata: true" "http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text" 2>/dev/null); then
+    CSP="azure"; ZONE=$(curl $TIMEOUT_FLAGS -fsS -H "Metadata: true" "http://169.254.169.254/metadata/instance/compute/zone?api-version=2021-02-01&format=text" 2>/dev/null || echo "1")
+fi
+echo "[*] Provider: $CSP ($REGION / $ZONE)"
+
+# --- 7. Initialization & Config ---
+echo "[*] Checking for existing wallet..."
+SHOULD_INIT=true
+if [ -f "$CONFIG_PATH" ]; then
+    # Extract the wallet path from the existing config
+    WALLET_FILE=$(sudo -u "$SERVICE_USER" jq -r '.key_manager.wallet_file // empty' "$CONFIG_PATH")
+    if [ -n "$WALLET_FILE" ] && [ -f "$WALLET_FILE" ]; then
+        echo "[*] Wallet detected at $WALLET_FILE. Skipping --init."
+        SHOULD_INIT=false
+    fi
 fi
 
-mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+if [ "$SHOULD_INIT" = true ]; then
+    echo "[*] Running gRPC initialization..."
+    sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}"
+fi
 
-sed -i 's/User=ubuntu/User='${SERVICE_USER}'/' ${INSTALL_ROOT}/dynamo.service
-sed -i 's/User=ubuntu/User='${SERVICE_USER}'/' ${INSTALL_ROOT}/dynamo-admin.service
-sed -i 's|/opt/dynamo/|'${INSTALL_ROOT}/'|g' ${INSTALL_ROOT}/dynamo.service
-sed -i 's|/opt/dynamo/|'${INSTALL_ROOT}/'|g' ${INSTALL_ROOT}/dynamo-admin.service
-sed -i 's|/opt/dynamo/|'${INSTALL_ROOT}/'|g' ${INSTALL_ROOT}/dynamo-ecc-enforcer.service
-sed -i 's|/opt/dynamo/|'${INSTALL_ROOT}/'|g' ${CONFIG_PATH}
+echo "[*] Patching configuration..."
+# Ensure config exists before jq reads it
+if [ ! -f "$CONFIG_PATH" ]; then
+    echo "{}" | sudo -u "$SERVICE_USER" tee "$CONFIG_PATH" > /dev/null
+fi
 
-sudo cp ${INSTALL_ROOT}/dynamo.service /etc/systemd/system/
-sudo cp ${INSTALL_ROOT}/dynamo-admin.service /etc/systemd/system/
-sudo cp ${INSTALL_ROOT}/dynamo-ecc-enforcer.service /etc/systemd/system/
+sudo -u "$SERVICE_USER" jq \
+    --arg csp "$CSP" --arg reg "$REGION" --arg zone "$ZONE" \
+    '. + {csp: $csp, csp_region: $reg, csp_zone: $zone}' \
+    "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && sudo -u "$SERVICE_USER" mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+
+# --- 8. Systemd Integration ---
+echo "[*] Configuring systemd services..."
+for svc in dynamo.service dynamo-admin.service dynamo-ecc-enforcer.service; do
+    sudo sed -i "s|User=ubuntu|User=$SERVICE_USER|g" "$INSTALL_ROOT/$svc"
+    sudo sed -i "s|/opt/dynamo/|$INSTALL_ROOT/|g" "$INSTALL_ROOT/$svc"
+    sudo cp "$INSTALL_ROOT/$svc" /etc/systemd/system/
+done
 
 sudo systemctl daemon-reload
+sudo systemctl enable --now dynamo.service dynamo-admin.service dynamo-ecc-enforcer.service
 
-sudo systemctl enable dynamo.service
-sudo systemctl enable dynamo-admin.service
-sudo systemctl enable dynamo-ecc-enforcer.service
-
-sudo systemctl start dynamo-ecc-enforcer.service
-sudo systemctl start dynamo.service
-sudo systemctl start dynamo-admin.service
-
-output=$(${INSTALL_ROOT}/noded --version -config=${CONFIG_PATH} 2>/dev/null)
+# --- 9. Verification ---
+output=$(sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --version --config="$CONFIG_PATH" 2>/dev/null)
 rc=$?
 if [ "$rc" -ne 0 ]; then
     echo "[FAIL] Dynamo installation failed"
+    exit 1
 fi
 
 echo
