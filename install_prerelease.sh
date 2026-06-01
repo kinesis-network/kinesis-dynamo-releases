@@ -1,5 +1,5 @@
 #!/bin/bash
-# Kinesis Dynamo Bootstrap Script: v0.2.0-beta8
+# Kinesis Dynamo Bootstrap Script: v0.2.2-alpha1
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -153,14 +153,18 @@ sudo -u "$SERVICE_USER" jq \
 
 # --- 8. Systemd Integration ---
 echo "[*] Configuring systemd services..."
-for svc in dynamo.service dynamo-admin.service dynamo-ecc-enforcer.service; do
+for svc in dynamo.service dynamo-admin.service dynamo-ecc-enforcer.service dynamo-firewall.service; do
     sudo sed -i "s|User=ubuntu|User=$SERVICE_USER|g" "$INSTALL_ROOT/$svc"
     sudo sed -i "s|/opt/dynamo/|$INSTALL_ROOT/|g" "$INSTALL_ROOT/$svc"
     sudo cp "$INSTALL_ROOT/$svc" /etc/systemd/system/
 done
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now dynamo.service dynamo-admin.service dynamo-ecc-enforcer.service
+sudo systemctl enable --now \
+  dynamo.service \
+  dynamo-admin.service \
+  dynamo-ecc-enforcer.service \
+  dynamo-firewall.service
 
 # --- 9. Verification ---
 output=$(sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --version --config="$CONFIG_PATH" 2>/dev/null)
