@@ -12,6 +12,7 @@ RELEASE_VERSION=${RELEASE_VERSION:-"latest"}
 INSTALL_ROOT=${INSTALL_ROOT:-"/opt/dynamo"}
 SERVICE_USER=${SERVICE_USER:-"$USER"}
 CONFIG_PATH="$INSTALL_ROOT/config.json"
+DYNAMO_SERVICES="dynamo.service dynamo-admin.service dynamo-ecc-enforcer.service dynamo-firewall.service"
 
 # --- 2. Environment Detection ---
 IS_WSL=false
@@ -76,7 +77,7 @@ fi
 
 # --- 4.5 Stop existing services if they exist ---
 echo "[*] Checking for existing services..."
-for svc in dynamo-admin.service dynamo.service dynamo-ecc-enforcer.service; do
+for svc in $DYNAMO_SERVICES; do
     if systemctl is-active --quiet "$svc"; then
         echo "[*] Stopping $svc..."
         sudo systemctl stop "$svc"
@@ -153,18 +154,14 @@ sudo -u "$SERVICE_USER" jq \
 
 # --- 8. Systemd Integration ---
 echo "[*] Configuring systemd services..."
-for svc in dynamo.service dynamo-admin.service dynamo-ecc-enforcer.service dynamo-firewall.service; do
+for svc in $DYNAMO_SERVICES; do
     sudo sed -i "s|User=ubuntu|User=$SERVICE_USER|g" "$INSTALL_ROOT/$svc"
     sudo sed -i "s|/opt/dynamo/|$INSTALL_ROOT/|g" "$INSTALL_ROOT/$svc"
     sudo cp "$INSTALL_ROOT/$svc" /etc/systemd/system/
 done
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now \
-  dynamo.service \
-  dynamo-admin.service \
-  dynamo-ecc-enforcer.service \
-  dynamo-firewall.service
+sudo systemctl enable --now $DYNAMO_SERVICES
 
 # --- 9. Verification ---
 output=$(sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --version --config="$CONFIG_PATH" 2>/dev/null)
