@@ -161,7 +161,24 @@ for svc in $DYNAMO_SERVICES; do
 done
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now $DYNAMO_SERVICES
+
+# Enable the firewall only when init marked this node for it (non-VPN nodes).
+# The marker is written by `noded --init`; VPN nodes leave it absent.
+FIREWALL_SERVICE="dynamo-firewall.service"
+CORE_SERVICES=""
+for svc in $DYNAMO_SERVICES; do
+    [ "$svc" != "$FIREWALL_SERVICE" ] && CORE_SERVICES="$CORE_SERVICES $svc"
+done
+
+sudo systemctl enable --now $CORE_SERVICES
+
+if [ -f "${INSTALL_ROOT}/firewall.enabled" ]; then
+    echo "[*] Firewall enabled for this node."
+    sudo systemctl enable --now "$FIREWALL_SERVICE"
+else
+    echo "[*] Firewall not enabled for this node; disabling service."
+    sudo systemctl disable --now "$FIREWALL_SERVICE"
+fi
 
 # --- 9. Verification ---
 output=$(sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --version --config="$CONFIG_PATH" 2>/dev/null)
