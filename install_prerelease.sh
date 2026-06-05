@@ -1,5 +1,5 @@
 #!/bin/bash
-# Kinesis Dynamo Bootstrap Script: v0.2.2-alpha4
+# Kinesis Dynamo Bootstrap Script: v0.2.2-alpha5
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -107,24 +107,7 @@ sudo bsdtar -xvf /tmp/dynamo.zip -C "$INSTALL_ROOT"
 sudo chown -R "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_ROOT"
 sudo rm /tmp/dynamo.zip
 
-# --- 6. Cloud Metadata (Simplified) ---
-echo "[*] Detecting Cloud Provider..."
-CSP="manual"; REGION="unknown"; ZONE="unknown"
-# Define common curl timeout settings
-# --connect-timeout: max time to wait for connection
-# -m, --max-time: max time for the whole operation
-TIMEOUT_FLAGS="--connect-timeout 2 --max-time 3"
-# AWS IMDSv2
-if TOKEN=$(curl $TIMEOUT_FLAGS -fsS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null); then
-    ZONE=$(curl $TIMEOUT_FLAGS -fsS -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/placement/availability-zone")
-    REGION="${ZONE%[a-z]}"; CSP="aws"
-# Azure
-elif REGION=$(curl $TIMEOUT_FLAGS -fsS -H "Metadata: true" "http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text" 2>/dev/null); then
-    CSP="azure"; ZONE=$(curl $TIMEOUT_FLAGS -fsS -H "Metadata: true" "http://169.254.169.254/metadata/instance/compute/zone?api-version=2021-02-01&format=text" 2>/dev/null || echo "1")
-fi
-echo "[*] Provider: $CSP ($REGION / $ZONE)"
-
-# --- 7. Initialization & Config ---
+# --- 6. Initialization & Config ---
 echo "[*] Checking for existing wallet..."
 SHOULD_INIT=true
 if [ -f "$CONFIG_PATH" ]; then
@@ -139,20 +122,53 @@ fi
 if [ "$SHOULD_INIT" = true ]; then
     echo "[*] Running gRPC initialization..."
     sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}"
+
+    # Detect the cloud provider and patch its metadata into the freshly
+    # generated config. Done only on init so re-running install.sh on an
+    # existing node respects its current values.
+    echo "[*] Detecting Cloud Provider..."
+    CSP="manual"; REGION="unknown"; ZONE="unknown"
+    # Define common curl timeout settings
+    # --connect-timeout: max time to wait for connection
+    # -m, --max-time: max time for the whole operation
+    TIMEOUT_FLAGS="--connect-timeout 2 --max-time 3"
+    # AWS IMDSv2
+    if TOKEN=$(curl $TIMEOUT_FLAGS -fsS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null); then
+        ZONE=$(curl $TIMEOUT_FLAGS -fsS -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/placement/availability-zone")
+        REGION="${ZONE%[a-z]}"; CSP="aws"
+    # Azure
+    elif REGION=$(curl $TIMEOUT_FLAGS -fsS -H "Metadata: true" "http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text" 2>/dev/null); then
+        CSP="azure"; ZONE=$(curl $TIMEOUT_FLAGS -fsS -H "Metadata: true" "http://169.254.169.254/metadata/instance/compute/zone?api-version=2021-02-01&format=text" 2>/dev/null || echo "1")
+    fi
+    echo "[*] Provider: $CSP ($REGION / $ZONE)"
+
+    if [ -f "$CONFIG_PATH" ]; then
+        echo "[*] Patching configuration..."
+        sudo -u "$SERVICE_USER" jq \
+            --arg csp "$CSP" --arg reg "$REGION" --arg zone "$ZONE" \
+            '. + {csp: $csp, csp_region: $reg, csp_zone: $zone}' \
+            "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && sudo -u "$SERVICE_USER" mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+    fi
 fi
 
-echo "[*] Patching configuration..."
-# Ensure config exists before jq reads it
-if [ ! -f "$CONFIG_PATH" ]; then
-    echo "{}" | sudo -u "$SERVICE_USER" tee "$CONFIG_PATH" > /dev/null
+# Reconcile firewall_addr from the firewall marker on every run, leaving all
+# other values in config.json untouched. This lets an existing node (which skips
+# --init above and never had firewall_addr) pick up the correct setting. The
+# marker is the single source of truth, written by `noded --init`; absent it the
+# firewall is disabled. FIREWALL_ADDR must match firewall.DefaultSocketPath.
+FIREWALL_MARKER="${INSTALL_ROOT}/firewall.enabled"
+FIREWALL_ADDR="unix:///var/run/kinesis-dynamo/firewall.sock"
+if [ -f "$CONFIG_PATH" ]; then
+    if [ -f "$FIREWALL_MARKER" ]; then
+        FW_FILTER='.plugins.docker.firewall_addr = $addr'
+    else
+        FW_FILTER='del(.plugins.docker.firewall_addr)'
+    fi
+    sudo -u "$SERVICE_USER" jq --arg addr "$FIREWALL_ADDR" "$FW_FILTER" \
+        "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && sudo -u "$SERVICE_USER" mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
 fi
 
-sudo -u "$SERVICE_USER" jq \
-    --arg csp "$CSP" --arg reg "$REGION" --arg zone "$ZONE" \
-    '. + {csp: $csp, csp_region: $reg, csp_zone: $zone}' \
-    "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && sudo -u "$SERVICE_USER" mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
-
-# --- 8. Systemd Integration ---
+# --- 7. Systemd Integration ---
 echo "[*] Configuring systemd services..."
 for svc in $DYNAMO_SERVICES; do
     sudo sed -i "s|User=ubuntu|User=$SERVICE_USER|g" "$INSTALL_ROOT/$svc"
@@ -172,7 +188,7 @@ done
 
 sudo systemctl enable --now $CORE_SERVICES
 
-if [ -f "${INSTALL_ROOT}/firewall.enabled" ]; then
+if [ -f "$FIREWALL_MARKER" ]; then
     echo "[*] Firewall enabled for this node."
     sudo systemctl enable --now "$FIREWALL_SERVICE"
 else
@@ -180,7 +196,7 @@ else
     sudo systemctl disable --now "$FIREWALL_SERVICE"
 fi
 
-# --- 9. Verification ---
+# --- 8. Verification ---
 output=$(sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --version --config="$CONFIG_PATH" 2>/dev/null)
 rc=$?
 if [ "$rc" -ne 0 ]; then
