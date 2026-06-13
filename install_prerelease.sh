@@ -1,5 +1,5 @@
 #!/bin/bash
-# Kinesis Dynamo Bootstrap Script: v0.2.3-beta2
+# Kinesis Dynamo Bootstrap Script: v0.2.4-beta1
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -13,6 +13,8 @@ INSTALL_ROOT=${INSTALL_ROOT:-"/opt/dynamo"}
 SERVICE_USER=${SERVICE_USER:-"$USER"}
 CONFIG_PATH="$INSTALL_ROOT/config.json"
 DYNAMO_SERVICES="dynamo.service dynamo-admin.service dynamo-ecc-enforcer.service dynamo-firewall.service"
+DOCKER_DATA_ROOT=${DOCKER_DATA_ROOT:-""}
+CONTAINERD_ROOT=${CONTAINERD_ROOT:-""}
 
 # --- 2. Environment Detection ---
 IS_WSL=false
@@ -36,6 +38,8 @@ echo "SERVICE_USER=$SERVICE_USER"
 echo "CONFIG_PATH=$CONFIG_PATH"
 echo "IS_WSL=$IS_WSL"
 echo "OS_ARCH=$OS_ARCH"
+echo "DOCKER_DATA_ROOT=${DOCKER_DATA_ROOT:-<default>}"
+echo "CONTAINERD_ROOT=${CONTAINERD_ROOT:-<default>}"
 
 # --- 3. Install Core Dependencies ---
 echo "[*] Installing system dependencies..."
@@ -55,6 +59,142 @@ fi
 sudo systemctl enable --now docker
 sudo usermod -aG docker "$SERVICE_USER"
 sudo usermod -aG systemd-journal "$SERVICE_USER"
+
+# --- 3.5. Optional: Relocate Docker data-root ---
+# When DOCKER_DATA_ROOT is set, point Docker at it instead of the default
+# /var/lib/docker. Two pieces:
+#   1. /etc/docker/daemon.json gets data-root merged in via jq, so we
+#      preserve any existing daemon settings (e.g. nvidia runtime).
+#   2. If the data-root lives on a separately-mounted filesystem (cloud
+#      ephemeral disks that mount late via cloud-init, attached NVMe,
+#      etc.), drop a docker.service unit override with
+#      RequiresMountsFor=<mount> so docker waits for the mount on every
+#      boot. Without this, on reboots where the mount comes up late
+#      docker starts first, finds its data-root path missing, and either
+#      falls back to / or mkdirs into the empty mountpoint dir which
+#      gets shadowed when the real filesystem mounts. The mount is
+#      derived from `df` so the caller only needs to set
+#      DOCKER_DATA_ROOT.
+# Existing data under /var/lib/docker is NOT migrated automatically; if
+# you care about preserving images/volumes, rsync them across before
+# re-running.
+if [ -n "$DOCKER_DATA_ROOT" ]; then
+    echo "[*] Configuring Docker data-root: $DOCKER_DATA_ROOT"
+    sudo mkdir -p "$DOCKER_DATA_ROOT" /etc/docker
+    DAEMON_JSON="/etc/docker/daemon.json"
+    if [ ! -s "$DAEMON_JSON" ]; then
+        echo '{}' | sudo tee "$DAEMON_JSON" > /dev/null
+    fi
+    NEED_RESTART=false
+    CURRENT_ROOT=$(sudo jq -r '."data-root" // ""' "$DAEMON_JSON")
+    if [ "$CURRENT_ROOT" != "$DOCKER_DATA_ROOT" ]; then
+        sudo jq --arg dr "$DOCKER_DATA_ROOT" '. + {"data-root": $dr}' "$DAEMON_JSON" \
+            | sudo tee "$DAEMON_JSON.tmp" > /dev/null
+        sudo mv "$DAEMON_JSON.tmp" "$DAEMON_JSON"
+        echo "[*] Wrote data-root to $DAEMON_JSON"
+        NEED_RESTART=true
+    else
+        echo "[*] Docker data-root already set to $DOCKER_DATA_ROOT in $DAEMON_JSON"
+    fi
+    DROPIN_DIR="/etc/systemd/system/docker.service.d"
+    DROPIN_FILE="$DROPIN_DIR/wait-for-data-root.conf"
+    DATA_ROOT_MOUNT=$(df --output=target "$DOCKER_DATA_ROOT" 2>/dev/null | tail -n1 | tr -d '[:space:]')
+    if [ -n "$DATA_ROOT_MOUNT" ] && [ "$DATA_ROOT_MOUNT" != "/" ]; then
+        DESIRED=$(printf '[Unit]\nRequiresMountsFor=%s\n' "$DATA_ROOT_MOUNT")
+        if [ ! -f "$DROPIN_FILE" ] || [ "$(sudo cat "$DROPIN_FILE")" != "$DESIRED" ]; then
+            echo "[*] data-root lives on $DATA_ROOT_MOUNT; ordering docker.service after the mount"
+            sudo mkdir -p "$DROPIN_DIR"
+            printf '%s\n' "$DESIRED" | sudo tee "$DROPIN_FILE" > /dev/null
+            sudo systemctl daemon-reload
+            NEED_RESTART=true
+        else
+            echo "[*] docker.service already waits for $DATA_ROOT_MOUNT (dropin up to date)"
+        fi
+    elif [ -f "$DROPIN_FILE" ]; then
+        echo "[*] data-root is on /; removing stale $DROPIN_FILE"
+        sudo rm -f "$DROPIN_FILE"
+        sudo systemctl daemon-reload
+        NEED_RESTART=true
+    fi
+    if [ "$NEED_RESTART" = true ]; then
+        echo "[*] Restarting docker to apply data-root / unit changes..."
+        sudo systemctl restart docker
+    fi
+fi
+
+# --- 3.6. Optional: Relocate containerd root ---
+# When CONTAINERD_ROOT is set, point the system containerd at it instead of
+# the default /var/lib/containerd. dockerd talks to the system containerd
+# over /run/containerd/containerd.sock, and depending on the engine version
+# and snapshotter choice (e.g. features.containerd-snapshotter), image
+# content can land under /var/lib/containerd rather than /var/lib/docker.
+# Same shape as 3.5:
+#   1. Edit /etc/containerd/config.toml so the top-level "root = ..." key
+#      points at $CONTAINERD_ROOT. We delete any existing top-level root
+#      line (commented or not) and insert a fresh one so we never end up
+#      with a TOML duplicate key.
+#   2. Drop a containerd.service unit override with RequiresMountsFor=<mount>
+#      to fix the same reboot race as docker. Since docker.service has
+#      Requires=containerd.service, this implicitly orders docker after
+#      the mount too.
+if [ -n "$CONTAINERD_ROOT" ]; then
+    echo "[*] Configuring containerd root: $CONTAINERD_ROOT"
+    sudo mkdir -p "$CONTAINERD_ROOT" /etc/containerd
+
+    CONTAINERD_CONFIG="/etc/containerd/config.toml"
+    if [ ! -s "$CONTAINERD_CONFIG" ]; then
+        echo "[*] No existing $CONTAINERD_CONFIG; generating defaults"
+        sudo containerd config default | sudo tee "$CONTAINERD_CONFIG" > /dev/null
+    fi
+
+    NEED_RESTART_CTRD=false
+    CURRENT_CTRD_ROOT=$(grep -E '^root[[:space:]]*=' "$CONTAINERD_CONFIG" | head -n1 \
+        | sed -E 's/^root[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/')
+    if [ "$CURRENT_CTRD_ROOT" != "$CONTAINERD_ROOT" ]; then
+        # Drop every top-level "root = " line (commented or not). The leading
+        # ^ anchors to column 0 so we don't touch nested "root" subkeys inside
+        # plugin tables, which are always indented.
+        sudo sed -i -E '/^#?root[[:space:]]*=/d' "$CONTAINERD_CONFIG"
+        if grep -qE '^version[[:space:]]*=' "$CONTAINERD_CONFIG"; then
+            sudo sed -i -E "/^version[[:space:]]*=/a root = \"$CONTAINERD_ROOT\"" "$CONTAINERD_CONFIG"
+        else
+            sudo sed -i -E "1i root = \"$CONTAINERD_ROOT\"" "$CONTAINERD_CONFIG"
+        fi
+        echo "[*] Set root = \"$CONTAINERD_ROOT\" in $CONTAINERD_CONFIG"
+        NEED_RESTART_CTRD=true
+    else
+        echo "[*] containerd root already set to $CONTAINERD_ROOT in $CONTAINERD_CONFIG"
+    fi
+
+    CTRD_DROPIN_DIR="/etc/systemd/system/containerd.service.d"
+    CTRD_DROPIN_FILE="$CTRD_DROPIN_DIR/wait-for-root.conf"
+    CTRD_MOUNT=$(df --output=target "$CONTAINERD_ROOT" 2>/dev/null | tail -n1 | tr -d '[:space:]')
+    if [ -n "$CTRD_MOUNT" ] && [ "$CTRD_MOUNT" != "/" ]; then
+        CTRD_DESIRED=$(printf '[Unit]\nRequiresMountsFor=%s\n' "$CTRD_MOUNT")
+        if [ ! -f "$CTRD_DROPIN_FILE" ] || [ "$(sudo cat "$CTRD_DROPIN_FILE")" != "$CTRD_DESIRED" ]; then
+            echo "[*] containerd root lives on $CTRD_MOUNT; ordering containerd.service after the mount"
+            sudo mkdir -p "$CTRD_DROPIN_DIR"
+            printf '%s\n' "$CTRD_DESIRED" | sudo tee "$CTRD_DROPIN_FILE" > /dev/null
+            sudo systemctl daemon-reload
+            NEED_RESTART_CTRD=true
+        else
+            echo "[*] containerd.service already waits for $CTRD_MOUNT (dropin up to date)"
+        fi
+    elif [ -f "$CTRD_DROPIN_FILE" ]; then
+        echo "[*] containerd root is on /; removing stale $CTRD_DROPIN_FILE"
+        sudo rm -f "$CTRD_DROPIN_FILE"
+        sudo systemctl daemon-reload
+        NEED_RESTART_CTRD=true
+    fi
+
+    if [ "$NEED_RESTART_CTRD" = true ]; then
+        # docker.service Requires=containerd.service, so restarting containerd
+        # alone leaves docker with a stale connection. Bounce both, in order.
+        echo "[*] Restarting containerd (and docker, which depends on it)..."
+        sudo systemctl restart containerd
+        sudo systemctl restart docker
+    fi
+fi
 
 # --- 4. GPU Detection & Toolkit ---
 HAS_NVIDIA_GPU=false
