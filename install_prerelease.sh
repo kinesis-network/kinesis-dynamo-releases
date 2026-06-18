@@ -1,5 +1,5 @@
 #!/bin/bash
-# Kinesis Dynamo Bootstrap Script: v0.2.4-beta1
+# Kinesis Dynamo Bootstrap Script: v0.2.5-alpha1
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -326,11 +326,21 @@ for svc in $DYNAMO_SERVICES; do
     [ "$svc" != "$FIREWALL_SERVICE" ] && CORE_SERVICES="$CORE_SERVICES $svc"
 done
 
-sudo systemctl enable --now $CORE_SERVICES
+# START_SERVICES=false enables the units without starting them, so a wrapper
+# (e.g. install-proxy.sh) can defer starting the dynamo service until later
+# steps complete. Defaults to true, preserving standalone install behavior.
+if [ "${START_SERVICES:-true}" = "true" ]; then
+    NOW="--now"
+else
+    echo "[*] START_SERVICES=false: enabling services without starting them."
+    NOW=""
+fi
+
+sudo systemctl enable $NOW $CORE_SERVICES
 
 if [ -f "$FIREWALL_MARKER" ]; then
     echo "[*] Firewall enabled for this node."
-    sudo systemctl enable --now "$FIREWALL_SERVICE"
+    sudo systemctl enable $NOW "$FIREWALL_SERVICE"
 else
     echo "[*] Firewall not enabled for this node; disabling service."
     sudo systemctl disable --now "$FIREWALL_SERVICE"
