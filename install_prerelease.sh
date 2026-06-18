@@ -12,6 +12,8 @@ RELEASE_VERSION=${RELEASE_VERSION:-"latest"}
 INSTALL_ROOT=${INSTALL_ROOT:-"/opt/dynamo"}
 SERVICE_USER=${SERVICE_USER:-"$USER"}
 CONFIG_PATH="$INSTALL_ROOT/config.json"
+# When true, `noded --init` is run with --test to generate test-specific config.
+FOR_TEST=${FOR_TEST:-false}
 DYNAMO_SERVICES="dynamo.service dynamo-admin.service dynamo-ecc-enforcer.service dynamo-firewall.service"
 DOCKER_DATA_ROOT=${DOCKER_DATA_ROOT:-""}
 CONTAINERD_ROOT=${CONTAINERD_ROOT:-""}
@@ -273,7 +275,9 @@ if [ "$SHOULD_INIT" = true ]; then
     # --lb-pool / --public-ip are only meaningful for a proxy token; for a normal
     # node they are empty and init ignores them. For a proxy token, init also
     # pre-registers the proxy and writes the bundle to $PROXY_DIR.
-    sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --lb-pool="${LB_POOL}" --public-ip="${PUBLIC_IP}"
+    TEST_ARG=""
+    [ "$FOR_TEST" = "true" ] && TEST_ARG="--test"
+    sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --lb-pool="${LB_POOL}" --public-ip="${PUBLIC_IP}" $TEST_ARG
 
     # Detect the cloud provider and patch its metadata into the freshly
     # generated config. Done only on init so re-running install.sh on an
