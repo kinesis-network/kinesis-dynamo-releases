@@ -1,5 +1,5 @@
-#!/bin/bash
-# Kinesis Dynamo Bootstrap Script: v0.2.4
+#!/bin/sh
+# Kinesis Dynamo Bootstrap Script: v0.2.5
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -12,9 +12,20 @@ RELEASE_VERSION=${RELEASE_VERSION:-"latest"}
 INSTALL_ROOT=${INSTALL_ROOT:-"/opt/dynamo"}
 SERVICE_USER=${SERVICE_USER:-"$USER"}
 CONFIG_PATH="$INSTALL_ROOT/config.json"
+# When true, `noded --init` is run with --test to generate test-specific config.
+FOR_TEST=${FOR_TEST:-false}
 DYNAMO_SERVICES="dynamo.service dynamo-admin.service dynamo-ecc-enforcer.service dynamo-firewall.service"
 DOCKER_DATA_ROOT=${DOCKER_DATA_ROOT:-""}
 CONTAINERD_ROOT=${CONTAINERD_ROOT:-""}
+
+# App-proxy provisioning (only used when PROVISION_TOKEN is a proxy token; for a
+# normal node these are empty/unused). LB_POOL / PUBLIC_IP are passed through to
+# `noded --init`, which pre-registers the proxy and writes a bundle to $PROXY_DIR.
+LB_POOL=${LB_POOL:-""}
+PUBLIC_IP=${PUBLIC_IP:-""}
+PROXY_DIR="$INSTALL_ROOT/proxy"
+NODE_PROXY_IMAGE=${NODE_PROXY_IMAGE:-"kinesisorg/node-proxy"}
+NODE_PROXY_RAW_BASE=${NODE_PROXY_RAW_BASE:-"https://raw.githubusercontent.com/kinesis-network/node-proxy/refs/heads/main/deploy"}
 
 # --- 2. Environment Detection ---
 IS_WSL=false
@@ -261,7 +272,12 @@ fi
 
 if [ "$SHOULD_INIT" = true ]; then
     echo "[*] Running gRPC initialization..."
-    sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}"
+    # --lb-pool / --public-ip are only meaningful for a proxy token; for a normal
+    # node they are empty and init ignores them. For a proxy token, init also
+    # pre-registers the proxy and writes the bundle to $PROXY_DIR.
+    TEST_ARG=""
+    [ "$FOR_TEST" = "true" ] && TEST_ARG="--test"
+    sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --lb-pool="${LB_POOL}" --public-ip="${PUBLIC_IP}" $TEST_ARG
 
     # Detect the cloud provider and patch its metadata into the freshly
     # generated config. Done only on init so re-running install.sh on an
@@ -326,14 +342,98 @@ for svc in $DYNAMO_SERVICES; do
     [ "$svc" != "$FIREWALL_SERVICE" ] && CORE_SERVICES="$CORE_SERVICES $svc"
 done
 
-sudo systemctl enable --now $CORE_SERVICES
+# Enable the units, but don't start them yet: app-proxy nodes must bring up the
+# node-proxy container first, and starting the dynamo service (which performs
+# RegisterNode) is the last step for both node kinds.
+sudo systemctl enable $CORE_SERVICES
 
-if [ -f "$FIREWALL_MARKER" ]; then
+# Enable the firewall only when init marked this node for it (non-VPN nodes; the
+# marker is written by `noded --init`, absent for VPN nodes) AND this is not an
+# app proxy. kinesis-firewall isn't integrated with the proxy service yet
+# (frontend rules would need to sync with the firewall), so proxy nodes keep
+# dynamo-firewall disabled even though they are non-VPN.
+if [ -f "$FIREWALL_MARKER" ] && [ ! -f "$PROXY_DIR/proxy.env" ]; then
+    ENABLE_FIREWALL=true
+else
+    ENABLE_FIREWALL=false
+fi
+
+if [ "$ENABLE_FIREWALL" = true ]; then
     echo "[*] Firewall enabled for this node."
-    sudo systemctl enable --now "$FIREWALL_SERVICE"
+    sudo systemctl enable "$FIREWALL_SERVICE"
 else
     echo "[*] Firewall not enabled for this node; disabling service."
     sudo systemctl disable --now "$FIREWALL_SERVICE"
+fi
+
+# --- 7b. App proxy setup ---
+# `noded --init` writes a bootstrap bundle ($PROXY_DIR/proxy.env) only when the
+# provisioning token is a proxy token. When present, stand up the node-proxy
+# container and activate the load balancer before starting the dynamo service.
+if [ -f "$PROXY_DIR/proxy.env" ]; then
+    echo "[*] App proxy detected; setting up node-proxy container..."
+    # proxy.env: ADMIN_HOST, MGMT_USERNAME, MGMT_PASSWORD, REDIS_ADDRS,
+    # REDIS_MASTER_NAME, REDIS_PASSWORD, CACERT_BASE64, CERT_FILE
+    . "$PROXY_DIR/proxy.env"
+
+    MOUNT_DIR="$PROXY_DIR/mount"
+    CERTS_DIR="$PROXY_DIR/certs"
+    # On-disk name for the shared wildcard. Matches what the Data Plane API writes
+    # on rotation (it sanitizes dots to underscores), so a renewal overwrites it.
+    WILDCARD_CERT_FILE="star_apps_kinesiscloud_com.pem"
+
+    sudo mkdir -p "$CERTS_DIR" "$MOUNT_DIR" "$PROXY_DIR/general" "$PROXY_DIR/logs"
+    sudo cp "$PROXY_DIR/$CERT_FILE" "$CERTS_DIR/$WILDCARD_CERT_FILE"
+
+    # Download the node-proxy config files and fill the per-proxy placeholders
+    # (DPA userlist password + admin-host ACL). dataplaneapi.yml is static.
+    curl -fsSL "$NODE_PROXY_RAW_BASE/haproxy.cfg.template" -o /tmp/haproxy.cfg.template
+    curl -fsSL "$NODE_PROXY_RAW_BASE/dataplaneapi.yml" -o /tmp/dataplaneapi.yml
+    sed -e "s|@ADMIN_HOST@|${ADMIN_HOST}|g" \
+        -e "s|@MGMT_USERNAME@|${MGMT_USERNAME}|g" \
+        -e "s|@MGMT_PASSWORD@|${MGMT_PASSWORD}|g" \
+        /tmp/haproxy.cfg.template | sudo tee "$MOUNT_DIR/haproxy.cfg" >/dev/null
+    sudo cp /tmp/dataplaneapi.yml "$MOUNT_DIR/dataplaneapi.yml"
+
+    echo "[*] Starting node-proxy container..."
+    sudo docker rm -f node-proxy >/dev/null 2>&1 || true
+    sudo docker run -d --name node-proxy \
+        --network=host --restart=always --pull=always \
+        -e ACME_SOCKET=/tmp/acme-sidecar.sock \
+        -e REDIS_ADDRS="$REDIS_ADDRS" \
+        -e REDIS_MASTER_NAME="$REDIS_MASTER_NAME" \
+        -e REDIS_PASSWORD="$REDIS_PASSWORD" \
+        -e CACERT_BASE64="$CACERT_BASE64" \
+        -v "$CERTS_DIR:/etc/haproxy/certs" \
+        -v "$MOUNT_DIR:/etc/haproxy/mount" \
+        -v "$PROXY_DIR/general:/etc/haproxy/general" \
+        -v "$PROXY_DIR/logs:/var/log/haproxy" \
+        "$NODE_PROXY_IMAGE"
+
+    echo "[*] Waiting for DataplaneAPI..."
+    DPA_HEALTHY=false
+    for _ in $(seq 1 30); do
+        if curl -fsS -u "$MGMT_USERNAME:$MGMT_PASSWORD" \
+             http://localhost:5555/v3/services/haproxy/runtime/info >/dev/null 2>&1; then
+            DPA_HEALTHY=true
+            break
+        fi
+        sleep 2
+    done
+
+    if [ "$DPA_HEALTHY" = true ]; then
+        echo "[*] Post-registering app proxy (activating load balancer)..."
+        sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --postreg --config="$CONFIG_PATH"
+    else
+        echo "[WARN] DataplaneAPI did not become healthy; skipping activation (LB stays pending)."
+    fi
+fi
+
+# Start the dynamo services last (-> RegisterNode).
+echo "[*] Starting dynamo services..."
+sudo systemctl start $CORE_SERVICES
+if [ "$ENABLE_FIREWALL" = true ]; then
+    sudo systemctl start "$FIREWALL_SERVICE"
 fi
 
 # --- 8. Verification ---
