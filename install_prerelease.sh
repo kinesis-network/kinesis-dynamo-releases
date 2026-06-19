@@ -1,5 +1,5 @@
-#!/bin/bash
-# Kinesis Dynamo Bootstrap Script: v0.2.5-alpha2
+#!/bin/sh
+# Kinesis Dynamo Bootstrap Script: v0.2.5-beta1
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -363,8 +363,7 @@ if [ -f "$PROXY_DIR/proxy.env" ]; then
     echo "[*] App proxy detected; setting up node-proxy container..."
     # proxy.env: ADMIN_HOST, MGMT_USERNAME, MGMT_PASSWORD, REDIS_ADDRS,
     # REDIS_MASTER_NAME, REDIS_PASSWORD, CACERT_BASE64, CERT_FILE
-    # shellcheck disable=SC1091
-    source "$PROXY_DIR/proxy.env"
+    . "$PROXY_DIR/proxy.env"
 
     MOUNT_DIR="$PROXY_DIR/mount"
     CERTS_DIR="$PROXY_DIR/certs"
