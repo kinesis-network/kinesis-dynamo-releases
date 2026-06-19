@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.2.5-beta1
+# Kinesis Dynamo Bootstrap Script: v0.2.5-beta2
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -347,7 +347,18 @@ done
 # RegisterNode) is the last step for both node kinds.
 sudo systemctl enable $CORE_SERVICES
 
-if [ -f "$FIREWALL_MARKER" ]; then
+# Enable the firewall only when init marked this node for it (non-VPN nodes; the
+# marker is written by `noded --init`, absent for VPN nodes) AND this is not an
+# app proxy. kinesis-firewall isn't integrated with the proxy service yet
+# (frontend rules would need to sync with the firewall), so proxy nodes keep
+# dynamo-firewall disabled even though they are non-VPN.
+if [ -f "$FIREWALL_MARKER" ] && [ ! -f "$PROXY_DIR/proxy.env" ]; then
+    ENABLE_FIREWALL=true
+else
+    ENABLE_FIREWALL=false
+fi
+
+if [ "$ENABLE_FIREWALL" = true ]; then
     echo "[*] Firewall enabled for this node."
     sudo systemctl enable "$FIREWALL_SERVICE"
 else
@@ -421,7 +432,7 @@ fi
 # Start the dynamo services last (-> RegisterNode).
 echo "[*] Starting dynamo services..."
 sudo systemctl start $CORE_SERVICES
-if [ -f "$FIREWALL_MARKER" ]; then
+if [ "$ENABLE_FIREWALL" = true ]; then
     sudo systemctl start "$FIREWALL_SERVICE"
 fi
 
