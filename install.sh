@@ -1,12 +1,12 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.2.10
+# Kinesis Dynamo Bootstrap Script: v0.2.11
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
 
-# --- 1. Configuration & Placeholders ---
-# These are replaced during deployment or set via environment
-PROVISION_TOKEN=${PROVISION_TOKEN:-"TOKEN_PLACEHOLDER"}
+# --- 1. Configuration ---
+# Set via environment (PROVISION_TOKEN is exported by the bootstrap script).
+PROVISION_TOKEN=${PROVISION_TOKEN:-""}
 UNIVERSE=${UNIVERSE:-"production"}
 RELEASE_VERSION=${RELEASE_VERSION:-"latest"}
 INSTALL_ROOT=${INSTALL_ROOT:-"/opt/dynamo"}
