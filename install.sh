@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.2.11
+# Kinesis Dynamo Bootstrap Script: v0.2.12
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -259,29 +259,23 @@ sudo chown -R "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_ROOT"
 sudo rm /tmp/dynamo.zip
 
 # --- 6. Initialization & Config ---
-echo "[*] Checking for existing wallet..."
-SHOULD_INIT=true
-if [ -f "$CONFIG_PATH" ]; then
-    # Extract the wallet path from the existing config
-    WALLET_FILE=$(sudo -u "$SERVICE_USER" jq -r '.key_manager.wallet_file // empty' "$CONFIG_PATH")
-    if [ -n "$WALLET_FILE" ] && [ -f "$WALLET_FILE" ]; then
-        echo "[*] Wallet detected at $WALLET_FILE. Skipping --init."
-        SHOULD_INIT=false
-    fi
-fi
+# --init runs on every install, including re-installs. It is idempotent: each
+# step decides for itself whether it applies, so an already-provisioned node
+# keeps its wallet and config and only has derived state reconciled.
+echo "[*] Running gRPC initialization..."
+# --lb-pool / --public-ip are only meaningful for a proxy token; for a normal
+# node they are empty and init ignores them. For a proxy token, init also
+# pre-registers the proxy and writes the bundle to $PROXY_DIR.
+TEST_ARG=""
+[ "$FOR_TEST" = "true" ] && TEST_ARG="--test"
+sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --lb-pool="${LB_POOL}" --public-ip="${PUBLIC_IP}" $TEST_ARG
 
-if [ "$SHOULD_INIT" = true ]; then
-    echo "[*] Running gRPC initialization..."
-    # --lb-pool / --public-ip are only meaningful for a proxy token; for a normal
-    # node they are empty and init ignores them. For a proxy token, init also
-    # pre-registers the proxy and writes the bundle to $PROXY_DIR.
-    TEST_ARG=""
-    [ "$FOR_TEST" = "true" ] && TEST_ARG="--test"
-    sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --lb-pool="${LB_POOL}" --public-ip="${PUBLIC_IP}" $TEST_ARG
-
-    # Detect the cloud provider and patch its metadata into the freshly
-    # generated config. Done only on init so re-running install.sh on an
-    # existing node respects its current values.
+# Detect the cloud provider and patch its metadata into the config, but only
+# when it is not recorded yet, so re-running install.sh on an existing node
+# respects its current values.
+CURRENT_CSP=""
+[ -f "$CONFIG_PATH" ] && CURRENT_CSP=$(sudo -u "$SERVICE_USER" jq -r '.csp // ""' "$CONFIG_PATH")
+if [ -z "$CURRENT_CSP" ]; then
     echo "[*] Detecting Cloud Provider..."
     CSP="manual"; REGION="unknown"; ZONE="unknown"
     # Define common curl timeout settings
@@ -307,22 +301,10 @@ if [ "$SHOULD_INIT" = true ]; then
     fi
 fi
 
-# Reconcile firewall_addr from the firewall marker on every run, leaving all
-# other values in config.json untouched. This lets an existing node (which skips
-# --init above and never had firewall_addr) pick up the correct setting. The
-# marker is the single source of truth, written by `noded --init`; absent it the
-# firewall is disabled. FIREWALL_ADDR must match firewall.DefaultSocketPath.
+# The marker is the single source of truth for the firewall, written (or removed)
+# by `noded --init`, which also reconciles plugins.docker.firewall_addr in
+# config.json against it. Here it only decides whether the systemd unit runs.
 FIREWALL_MARKER="${INSTALL_ROOT}/firewall.enabled"
-FIREWALL_ADDR="unix:///var/run/kinesis-dynamo/firewall.sock"
-if [ -f "$CONFIG_PATH" ]; then
-    if [ -f "$FIREWALL_MARKER" ]; then
-        FW_FILTER='.plugins.docker.firewall_addr = $addr'
-    else
-        FW_FILTER='del(.plugins.docker.firewall_addr)'
-    fi
-    sudo -u "$SERVICE_USER" jq --arg addr "$FIREWALL_ADDR" "$FW_FILTER" \
-        "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && sudo -u "$SERVICE_USER" mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
-fi
 
 # --- 7. Systemd Integration ---
 echo "[*] Configuring systemd services..."
