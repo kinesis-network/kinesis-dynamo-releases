@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.2.15-beta1
+# Kinesis Dynamo Bootstrap Script: v0.2.15-beta2
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -258,10 +258,16 @@ if [ "$HAS_NVIDIA_GPU" = true ]; then
     # running container on the node.  So restart only when the daemon's actual
     # state disagrees with the file: either we just changed it, or a daemon
     # older than the file never loaded it.
-    NVIDIA_SUM_BEFORE=$(sudo md5sum "$DAEMON_JSON" 2>/dev/null | awk '{print $1}')
+    #
+    # Compared as canonical JSON (jq -S: keys sorted, whitespace normalized)
+    # rather than as bytes.  nvidia-ctk rewrites daemon.json in its own
+    # formatting whenever it finds it written in someone else's -- 3.4 above
+    # writes it with jq, so a byte comparison reports a change on a file whose
+    # meaning is identical, and restarts for nothing.
+    NVIDIA_CFG_BEFORE=$(sudo jq -S . "$DAEMON_JSON" 2>/dev/null || echo "")
     sudo nvidia-ctk runtime configure --runtime=docker
-    NVIDIA_SUM_AFTER=$(sudo md5sum "$DAEMON_JSON" 2>/dev/null | awk '{print $1}')
-    if [ "$NVIDIA_SUM_BEFORE" != "$NVIDIA_SUM_AFTER" ]; then
+    NVIDIA_CFG_AFTER=$(sudo jq -S . "$DAEMON_JSON" 2>/dev/null || echo "")
+    if [ "$NVIDIA_CFG_BEFORE" != "$NVIDIA_CFG_AFTER" ]; then
         echo "[*] Registered the nvidia runtime; restarting docker to load it"
         sudo systemctl restart docker
     elif ! sudo docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'; then
