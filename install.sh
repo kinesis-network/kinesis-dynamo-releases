@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.2.14
+# Kinesis Dynamo Bootstrap Script: v0.2.15
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -71,6 +71,39 @@ sudo systemctl enable --now docker
 sudo usermod -aG docker "$SERVICE_USER"
 sudo usermod -aG systemd-journal "$SERVICE_USER"
 
+# --- 3.4. Keep containers alive across daemon restarts ---
+# Docker's default is to SIGKILL every running container when dockerd stops, so
+# any `systemctl restart docker` below -- or an unrelated daemon upgrade months
+# from now -- takes the node's entire workload down with it.  Nothing brings it
+# back either: dynamo creates containers with no restart policy, and its app
+# keeper only re-runs gateway containers, so the rest sit Exited until the
+# runtime manager happens to issue an order.  live-restore leaves them running
+# while the daemon is away.
+#
+# Applied with `reload` (SIGHUP) rather than `restart`: live-restore is one of
+# the options dockerd re-reads on reload, so turning it on does not cost the
+# very outage it exists to prevent.
+#
+# Two things it does not cover, both acceptable here: it is unsupported under
+# swarm mode (unused on these nodes), and it does not carry containers across a
+# restart that changes daemon options such as data-root -- see 3.5, where such
+# a change is real and rare.
+DAEMON_JSON="/etc/docker/daemon.json"
+sudo mkdir -p /etc/docker
+if [ ! -s "$DAEMON_JSON" ]; then
+    echo '{}' | sudo tee "$DAEMON_JSON" > /dev/null
+fi
+if [ "$(sudo jq -r '."live-restore" // false' "$DAEMON_JSON")" = "true" ]; then
+    echo "[*] Docker live-restore already enabled"
+else
+    echo "[*] Enabling Docker live-restore so containers survive daemon restarts"
+    sudo jq '. + {"live-restore": true}' "$DAEMON_JSON" | sudo tee "$DAEMON_JSON.tmp" > /dev/null
+    sudo mv "$DAEMON_JSON.tmp" "$DAEMON_JSON"
+    if ! sudo systemctl reload docker; then
+        echo "[!] Could not reload docker; live-restore takes effect on its next restart"
+    fi
+fi
+
 # --- 3.5. Optional: Relocate Docker data-root ---
 # When DOCKER_DATA_ROOT is set, point Docker at it instead of the default
 # /var/lib/docker. Two pieces:
@@ -91,11 +124,7 @@ sudo usermod -aG systemd-journal "$SERVICE_USER"
 # re-running.
 if [ -n "$DOCKER_DATA_ROOT" ]; then
     echo "[*] Configuring Docker data-root: $DOCKER_DATA_ROOT"
-    sudo mkdir -p "$DOCKER_DATA_ROOT" /etc/docker
-    DAEMON_JSON="/etc/docker/daemon.json"
-    if [ ! -s "$DAEMON_JSON" ]; then
-        echo '{}' | sudo tee "$DAEMON_JSON" > /dev/null
-    fi
+    sudo mkdir -p "$DOCKER_DATA_ROOT"
     NEED_RESTART=false
     CURRENT_ROOT=$(sudo jq -r '."data-root" // ""' "$DAEMON_JSON")
     if [ "$CURRENT_ROOT" != "$DOCKER_DATA_ROOT" ]; then
@@ -222,8 +251,31 @@ if [ "$HAS_NVIDIA_GPU" = true ]; then
         sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
         sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
     sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+    # `nvidia-ctk runtime configure` is idempotent, but restarting docker to
+    # pick it up is not.  Re-running this script to upgrade an existing GPU
+    # node hits this line with the runtime already registered and the daemon
+    # already running it, where the restart buys nothing and costs every
+    # running container on the node.  So restart only when the daemon's actual
+    # state disagrees with the file: either we just changed it, or a daemon
+    # older than the file never loaded it.
+    #
+    # Compared as canonical JSON (jq -S: keys sorted, whitespace normalized)
+    # rather than as bytes.  nvidia-ctk rewrites daemon.json in its own
+    # formatting whenever it finds it written in someone else's -- 3.4 above
+    # writes it with jq, so a byte comparison reports a change on a file whose
+    # meaning is identical, and restarts for nothing.
+    NVIDIA_CFG_BEFORE=$(sudo jq -S . "$DAEMON_JSON" 2>/dev/null || echo "")
     sudo nvidia-ctk runtime configure --runtime=docker
-    sudo systemctl restart docker
+    NVIDIA_CFG_AFTER=$(sudo jq -S . "$DAEMON_JSON" 2>/dev/null || echo "")
+    if [ "$NVIDIA_CFG_BEFORE" != "$NVIDIA_CFG_AFTER" ]; then
+        echo "[*] Registered the nvidia runtime; restarting docker to load it"
+        sudo systemctl restart docker
+    elif ! sudo docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'; then
+        echo "[*] Docker is not running the nvidia runtime yet; restarting"
+        sudo systemctl restart docker
+    else
+        echo "[*] Docker already runs the nvidia runtime; skipping restart"
+    fi
 fi
 
 # --- 4.5 Stop existing services if they exist ---
