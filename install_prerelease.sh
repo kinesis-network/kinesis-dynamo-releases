@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.0-alpha3
+# Kinesis Dynamo Bootstrap Script: v0.4.0-alpha4
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -14,7 +14,7 @@ SERVICE_USER=${SERVICE_USER:-"$USER"}
 CONFIG_PATH="$INSTALL_ROOT/config.json"
 # When true, `noded --init` is run with --test to generate test-specific config.
 FOR_TEST=${FOR_TEST:-false}
-DYNAMO_SERVICES="dynamo.service dynamo-admin.service dynamo-ecc-enforcer.service dynamo-firewall.service"
+DYNAMO_SERVICES="dynamo.service dynamo-admin.service dynamo-gpu-enforcer.service dynamo-gpu-enforcer.path dynamo-firewall.service"
 DOCKER_DATA_ROOT=${DOCKER_DATA_ROOT:-""}
 CONTAINERD_ROOT=${CONTAINERD_ROOT:-""}
 
@@ -365,6 +365,20 @@ for svc in $DYNAMO_SERVICES; do
     sudo sed -i "s|/opt/dynamo/|$INSTALL_ROOT/|g" "$INSTALL_ROOT/$svc"
     sudo cp "$INSTALL_ROOT/$svc" /etc/systemd/system/
 done
+
+# The gpu re-apply unit is only ever activated by the .path watcher and has no
+# [Install] section, so it is installed but never enabled (it must not go
+# through the enable loop below).
+sudo sed -i "s|/opt/dynamo/|$INSTALL_ROOT/|g" "$INSTALL_ROOT/dynamo-gpu-enforcer-reapply.service"
+sudo cp "$INSTALL_ROOT/dynamo-gpu-enforcer-reapply.service" /etc/systemd/system/
+
+# The GPU enforcer absorbed the ECC enforcer; retire the old unit on upgraded
+# nodes so both don't run.
+if [ -f /etc/systemd/system/dynamo-ecc-enforcer.service ]; then
+    sudo systemctl disable dynamo-ecc-enforcer.service 2>/dev/null || true
+    sudo rm -f /etc/systemd/system/dynamo-ecc-enforcer.service
+    echo "[*] Retired dynamo-ecc-enforcer (absorbed by dynamo-gpu-enforcer)"
+fi
 
 sudo systemctl daemon-reload
 
