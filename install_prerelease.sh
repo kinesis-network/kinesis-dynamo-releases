@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.0-alpha10
+# Kinesis Dynamo Bootstrap Script: v0.4.0-alpha11
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
