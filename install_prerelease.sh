@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.0-beta2
+# Kinesis Dynamo Bootstrap Script: v0.4.1-alpha1
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -15,6 +15,22 @@ CONFIG_PATH="$INSTALL_ROOT/config.json"
 # When true, `noded --init` is run with --test to generate test-specific config.
 FOR_TEST=${FOR_TEST:-false}
 DYNAMO_SERVICES="dynamo.service dynamo-admin.service dynamo-gpu-enforcer.service dynamo-gpu-enforcer.path dynamo-firewall.service"
+STATOR_SERVICE="dynamo-stator.service"
+
+# Whether dynamo (and the container runtime) is set up on this node.
+# ENABLE_DYNAMO=false provisions a dynamoless node: the customer uses it over
+# SSH and Stator, not dynamo, is the admin agent. This is an install-time
+# posture, not a node class -- the owner may start or stop dynamo freely
+# afterwards. The decision is recorded in a marker (dynamo.disabled; negative
+# so legacy nodes without it keep running dynamo), so re-runs keep the posture
+# without re-passing the variable; an explicit ENABLE_DYNAMO on a re-run
+# converts the node.
+ENABLE_DYNAMO_EXPLICIT="${ENABLE_DYNAMO:-}"
+ENABLE_DYNAMO="$ENABLE_DYNAMO_EXPLICIT"
+if [ -z "$ENABLE_DYNAMO" ] && [ -f "$INSTALL_ROOT/dynamo.disabled" ]; then
+    ENABLE_DYNAMO=false
+fi
+[ "$ENABLE_DYNAMO" = "false" ] || ENABLE_DYNAMO=true
 DOCKER_DATA_ROOT=${DOCKER_DATA_ROOT:-""}
 CONTAINERD_ROOT=${CONTAINERD_ROOT:-""}
 
@@ -51,11 +67,21 @@ echo "IS_WSL=$IS_WSL"
 echo "OS_ARCH=$OS_ARCH"
 echo "DOCKER_DATA_ROOT=${DOCKER_DATA_ROOT:-<default>}"
 echo "CONTAINERD_ROOT=${CONTAINERD_ROOT:-<default>}"
+echo "ENABLE_DYNAMO=$ENABLE_DYNAMO"
 
 # --- 3. Install Core Dependencies ---
 echo "[*] Installing system dependencies..."
 sudo apt-get update -y
 sudo apt-get install -y jq curl gnupg lsb-release libarchive-tools pciutils
+
+sudo usermod -aG systemd-journal "$SERVICE_USER"
+
+# The whole container-runtime section is skipped wholesale on a dynamoless
+# node: none of it belongs there, and mutating Docker config on a BYOD machine
+# can break things the owner runs themselves.
+if [ "$ENABLE_DYNAMO" = false ]; then
+    echo "[*] Dynamo disabled: skipping container runtime setup (Docker/NVIDIA)"
+else
 
 # Docker Setup
 if ! command -v docker >/dev/null 2>&1; then
@@ -69,7 +95,6 @@ fi
 
 sudo systemctl enable --now docker
 sudo usermod -aG docker "$SERVICE_USER"
-sudo usermod -aG systemd-journal "$SERVICE_USER"
 
 # --- 3.4. Keep containers alive across daemon restarts ---
 # Docker's default is to SIGKILL every running container when dockerd stops, so
@@ -278,9 +303,11 @@ if [ "$HAS_NVIDIA_GPU" = true ]; then
     fi
 fi
 
+fi # ENABLE_DYNAMO: end of the container-runtime setup
+
 # --- 4.5 Stop existing services if they exist ---
 echo "[*] Checking for existing services..."
-for svc in $DYNAMO_SERVICES; do
+for svc in $DYNAMO_SERVICES $STATOR_SERVICE; do
     if systemctl is-active --quiet "$svc"; then
         echo "[*] Stopping $svc..."
         sudo systemctl stop "$svc"
@@ -320,7 +347,23 @@ echo "[*] Running gRPC initialization..."
 # pre-registers the proxy and writes the bundle to $PROXY_DIR.
 TEST_ARG=""
 [ "$FOR_TEST" = "true" ] && TEST_ARG="--test"
-sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --lb-pool="${LB_POOL}" --public-ip="${PUBLIC_IP}" $TEST_ARG
+# An explicitly passed posture is recorded in the marker here too: --init only
+# rewrites it when a token is redeemed, and posture conversions re-run without
+# one.
+if [ "$ENABLE_DYNAMO_EXPLICIT" = "false" ]; then
+    sudo -u "$SERVICE_USER" touch "$INSTALL_ROOT/dynamo.disabled"
+elif [ -n "$ENABLE_DYNAMO_EXPLICIT" ]; then
+    sudo rm -f "$INSTALL_ROOT/dynamo.disabled"
+fi
+sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --lb-pool="${LB_POOL}" --public-ip="${PUBLIC_IP}" --enable-dynamo="${ENABLE_DYNAMO}" $TEST_ARG
+
+# The redeemed token's initial_state may have just disabled dynamo (recorded
+# in the marker by --init). Honor it in this same run: the container runtime
+# was already installed above, which is harmless, but the wrong agent must not
+# be enabled below. An explicit ENABLE_DYNAMO from the caller still wins.
+if [ -z "$ENABLE_DYNAMO_EXPLICIT" ] && [ -f "$INSTALL_ROOT/dynamo.disabled" ]; then
+    ENABLE_DYNAMO=false
+fi
 
 # Detect the cloud provider and patch its metadata into the config, but only
 # when it is not recorded yet, so re-running install.sh on an existing node
@@ -372,6 +415,12 @@ done
 sudo sed -i "s|/opt/dynamo/|$INSTALL_ROOT/|g" "$INSTALL_ROOT/dynamo-gpu-enforcer-reapply.service"
 sudo cp "$INSTALL_ROOT/dynamo-gpu-enforcer-reapply.service" /etc/systemd/system/
 
+# Stator's unit runs as root (no User= rewrite). Installed on every node but
+# enabled only on dynamoless nodes below; on dynamo nodes the unit file is
+# staged for the later fleet rollout and stays disabled.
+sudo sed -i "s|/opt/dynamo/|$INSTALL_ROOT/|g" "$INSTALL_ROOT/$STATOR_SERVICE"
+sudo cp "$INSTALL_ROOT/$STATOR_SERVICE" /etc/systemd/system/
+
 # The GPU enforcer absorbed the ECC enforcer; retire the old unit on upgraded
 # nodes so both don't run.
 if [ -f /etc/systemd/system/dynamo-ecc-enforcer.service ]; then
@@ -390,10 +439,20 @@ for svc in $DYNAMO_SERVICES; do
     [ "$svc" != "$FIREWALL_SERVICE" ] && CORE_SERVICES="$CORE_SERVICES $svc"
 done
 
-# Enable the units, but don't start them yet: app-proxy nodes must bring up the
-# node-proxy container first, and starting the dynamo service (which performs
-# RegisterNode) is the last step for both node kinds.
-sudo systemctl enable $CORE_SERVICES
+if [ "$ENABLE_DYNAMO" = false ]; then
+    # Stator is the only enabled agent. dynamo's units stay present but
+    # disabled (a converted node also lands here); the firewall is handled by
+    # the marker logic below, which init leaves absent when dynamo is off.
+    sudo systemctl disable $CORE_SERVICES 2>/dev/null || true
+    sudo systemctl enable "$STATOR_SERVICE"
+else
+    # Dynamo node; make sure a leftover stator from a converted node is off.
+    sudo systemctl disable --now "$STATOR_SERVICE" 2>/dev/null || true
+    # Enable the units, but don't start them yet: app-proxy nodes must bring up
+    # the node-proxy container first, and starting the dynamo service (which
+    # performs RegisterNode) is the last step for both node kinds.
+    sudo systemctl enable $CORE_SERVICES
+fi
 
 # Enable the firewall only when init marked this node for it (non-VPN nodes; the
 # marker is written by `noded --init`, absent for VPN nodes) AND this is not an
@@ -477,15 +536,45 @@ if [ -f "$PROXY_DIR/proxy.env" ]; then
     fi
 fi
 
-# Start the dynamo services last (-> RegisterNode).
-echo "[*] Starting dynamo services..."
-sudo systemctl start $CORE_SERVICES
-if [ "$ENABLE_FIREWALL" = true ]; then
-    sudo systemctl start "$FIREWALL_SERVICE"
+if [ "$ENABLE_DYNAMO" = false ]; then
+    # Write Stator's config and start it. Stator deliberately does not parse
+    # dynamo's config.json (that schema is dynamo's to change); stator.json is
+    # the whole contract. Kept across tokenless re-runs, mirroring --init's
+    # identity semantics.
+    STATOR_CONFIG="$INSTALL_ROOT/stator.json"
+    if [ -n "$PROVISION_TOKEN" ] || [ ! -f "$STATOR_CONFIG" ]; then
+        MM_LIST="${PROVISION_TOKEN#*@}"
+        [ "$MM_LIST" = "$PROVISION_TOKEN" ] && MM_LIST=""
+        sudo -u "$SERVICE_USER" jq -n \
+            --arg universe "$UNIVERSE" \
+            --arg ssh_user "$SERVICE_USER" \
+            --arg wallet "$INSTALL_ROOT/node.key" \
+            --arg admin_key "$INSTALL_ROOT/admin-ssh.pub" \
+            --arg mm "$MM_LIST" \
+            '{universe: $universe, ssh_user: $ssh_user,
+              key_manager: {type: "plaintext", wallet_file: $wallet},
+              admin_ssh_key_file: $admin_key}
+             + (if $mm != "" then {mm_list: ($mm | split("@"))} else {} end)' \
+            | sudo -u "$SERVICE_USER" tee "$STATOR_CONFIG" > /dev/null
+        echo "[*] Wrote $STATOR_CONFIG"
+    fi
+    echo "[*] Starting stator..."
+    sudo systemctl restart "$STATOR_SERVICE"
+else
+    # Start the dynamo services last (-> RegisterNode).
+    echo "[*] Starting dynamo services..."
+    sudo systemctl start $CORE_SERVICES
+    if [ "$ENABLE_FIREWALL" = true ]; then
+        sudo systemctl start "$FIREWALL_SERVICE"
+    fi
 fi
 
 # --- 8. Verification ---
-output=$(sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --version --config="$CONFIG_PATH" 2>/dev/null)
+if [ "$ENABLE_DYNAMO" = false ]; then
+    output=$("${INSTALL_ROOT}/stator" --version 2>/dev/null)
+else
+    output=$(sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --version --config="$CONFIG_PATH" 2>/dev/null)
+fi
 rc=$?
 if [ "$rc" -ne 0 ]; then
     echo "[FAIL] Dynamo installation failed"
