@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.1-alpha3
+# Kinesis Dynamo Bootstrap Script: v0.4.1-alpha4
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -415,9 +415,10 @@ done
 sudo sed -i "s|/opt/dynamo/|$INSTALL_ROOT/|g" "$INSTALL_ROOT/dynamo-gpu-enforcer-reapply.service"
 sudo cp "$INSTALL_ROOT/dynamo-gpu-enforcer-reapply.service" /etc/systemd/system/
 
-# Stator's unit runs as root (no User= rewrite). Installed on every node but
-# enabled only on dynamoless nodes below; on dynamo nodes the unit file is
-# staged for the later fleet rollout and stays disabled.
+# Stator's unit runs as root (no User= rewrite). Installed and enabled on
+# every node (Phase 2 fleet rollout): on a dynamoless node it is the only
+# agent, on a dynamo node it runs beside dynamo. The two never coordinate;
+# each reports its own part of the node to the Node Manager.
 sudo sed -i "s|/opt/dynamo/|$INSTALL_ROOT/|g" "$INSTALL_ROOT/$STATOR_SERVICE"
 sudo cp "$INSTALL_ROOT/$STATOR_SERVICE" /etc/systemd/system/
 
@@ -439,15 +440,15 @@ for svc in $DYNAMO_SERVICES; do
     [ "$svc" != "$FIREWALL_SERVICE" ] && CORE_SERVICES="$CORE_SERVICES $svc"
 done
 
+# Stator is enabled on every node; it is started below once stator.json is
+# in place.
+sudo systemctl enable "$STATOR_SERVICE"
 if [ "$ENABLE_DYNAMO" = false ]; then
     # Stator is the only enabled agent. dynamo's units stay present but
     # disabled (a converted node also lands here); the firewall is handled by
     # the marker logic below, which init leaves absent when dynamo is off.
     sudo systemctl disable $CORE_SERVICES 2>/dev/null || true
-    sudo systemctl enable "$STATOR_SERVICE"
 else
-    # Dynamo node; make sure a leftover stator from a converted node is off.
-    sudo systemctl disable --now "$STATOR_SERVICE" 2>/dev/null || true
     # Enable the units, but don't start them yet: app-proxy nodes must bring up
     # the node-proxy container first, and starting the dynamo service (which
     # performs RegisterNode) is the last step for both node kinds.
@@ -536,32 +537,33 @@ if [ -f "$PROXY_DIR/proxy.env" ]; then
     fi
 fi
 
-if [ "$ENABLE_DYNAMO" = false ]; then
-    # Write Stator's config and start it. Stator deliberately does not parse
-    # dynamo's config.json (that schema is dynamo's to change); stator.json is
-    # the whole contract. Kept across tokenless re-runs, mirroring --init's
-    # identity semantics.
-    STATOR_CONFIG="$INSTALL_ROOT/stator.json"
-    if [ -n "$PROVISION_TOKEN" ] || [ ! -f "$STATOR_CONFIG" ]; then
-        MM_LIST="${PROVISION_TOKEN#*@}"
-        [ "$MM_LIST" = "$PROVISION_TOKEN" ] && MM_LIST=""
-        sudo -u "$SERVICE_USER" jq -n \
-            --arg universe "$UNIVERSE" \
-            --arg ssh_user "$SERVICE_USER" \
-            --arg wallet "$INSTALL_ROOT/node.key" \
-            --arg admin_key "$INSTALL_ROOT/admin-ssh.pub" \
-            --arg mm "$MM_LIST" \
-            '{universe: $universe, ssh_user: $ssh_user,
-              key_manager: {type: "plaintext", wallet_file: $wallet},
-              admin_ssh_key_file: $admin_key}
-             + (if $mm != "" then {mm_list: ($mm | split("@"))} else {} end)' \
-            | sudo -u "$SERVICE_USER" tee "$STATOR_CONFIG" > /dev/null
-        echo "[*] Wrote $STATOR_CONFIG"
-    fi
-    echo "[*] Starting stator..."
-    sudo systemctl restart "$STATOR_SERVICE"
-else
-    # Start the dynamo services last (-> RegisterNode).
+# Write Stator's config and start it -- on every node. Stator deliberately
+# does not parse dynamo's config.json (that schema is dynamo's to change);
+# stator.json is the whole contract. Kept across tokenless re-runs, mirroring
+# --init's identity semantics.
+STATOR_CONFIG="$INSTALL_ROOT/stator.json"
+if [ -n "$PROVISION_TOKEN" ] || [ ! -f "$STATOR_CONFIG" ]; then
+    MM_LIST="${PROVISION_TOKEN#*@}"
+    [ "$MM_LIST" = "$PROVISION_TOKEN" ] && MM_LIST=""
+    sudo -u "$SERVICE_USER" jq -n \
+        --arg universe "$UNIVERSE" \
+        --arg ssh_user "$SERVICE_USER" \
+        --arg wallet "$INSTALL_ROOT/node.key" \
+        --arg admin_key "$INSTALL_ROOT/admin-ssh.pub" \
+        --arg mm "$MM_LIST" \
+        '{universe: $universe, ssh_user: $ssh_user,
+          key_manager: {type: "plaintext", wallet_file: $wallet},
+          admin_ssh_key_file: $admin_key}
+         + (if $mm != "" then {mm_list: ($mm | split("@"))} else {} end)' \
+        | sudo -u "$SERVICE_USER" tee "$STATOR_CONFIG" > /dev/null
+    echo "[*] Wrote $STATOR_CONFIG"
+fi
+echo "[*] Starting stator..."
+sudo systemctl restart "$STATOR_SERVICE"
+
+if [ "$ENABLE_DYNAMO" = true ]; then
+    # Start the dynamo services last (-> RegisterNode). Order relative to
+    # Stator does not matter: the two agents report independently.
     echo "[*] Starting dynamo services..."
     sudo systemctl start $CORE_SERVICES
     if [ "$ENABLE_FIREWALL" = true ]; then
