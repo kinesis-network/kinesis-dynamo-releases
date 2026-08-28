@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.1-beta2
+# Kinesis Dynamo Bootstrap Script: v0.4.1-beta3
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -493,15 +493,32 @@ if [ -f "$PROXY_DIR/proxy.env" ]; then
     sudo mkdir -p "$CERTS_DIR" "$MOUNT_DIR" "$PROXY_DIR/general" "$PROXY_DIR/logs"
     sudo cp "$PROXY_DIR/$CERT_FILE" "$CERTS_DIR/$WILDCARD_CERT_FILE"
 
-    # Download the node-proxy config files and fill the per-proxy placeholders
-    # (DPA userlist password + admin-host ACL). dataplaneapi.yml is static.
-    curl -fsSL "$NODE_PROXY_RAW_BASE/haproxy.cfg.template" -o /tmp/haproxy.cfg.template
+    # dataplaneapi.yml is static and always refreshed. haproxy.cfg is NOT: the
+    # mounted file is the DataPlane API's live config (dataplaneapi.yml
+    # config_file), i.e. where every frontend/backend the managers ever pushed
+    # to this LB is persisted. It is rendered from the template only on a fresh
+    # provision (token given, so proxy.env and its DPA password are new) or
+    # when it does not exist yet; a re-run (self-upgrade) leaves it alone, and
+    # the container recreate below picks it up unchanged from the mount. The
+    # one overwrite that remains keeps a timestamped copy, since the DPA's own
+    # backups live inside the container and do not survive `docker rm`.
     curl -fsSL "$NODE_PROXY_RAW_BASE/dataplaneapi.yml" -o /tmp/dataplaneapi.yml
-    sed -e "s|@ADMIN_HOST@|${ADMIN_HOST}|g" \
-        -e "s|@MGMT_USERNAME@|${MGMT_USERNAME}|g" \
-        -e "s|@MGMT_PASSWORD@|${MGMT_PASSWORD}|g" \
-        /tmp/haproxy.cfg.template | sudo tee "$MOUNT_DIR/haproxy.cfg" >/dev/null
     sudo cp /tmp/dataplaneapi.yml "$MOUNT_DIR/dataplaneapi.yml"
+    if [ -n "$PROVISION_TOKEN" ] || [ ! -f "$MOUNT_DIR/haproxy.cfg" ]; then
+        if [ -f "$MOUNT_DIR/haproxy.cfg" ]; then
+            BACKUP="$MOUNT_DIR/haproxy.cfg.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+            sudo cp "$MOUNT_DIR/haproxy.cfg" "$BACKUP"
+            echo "[*] Re-provisioning: previous haproxy.cfg saved as $BACKUP"
+        fi
+        curl -fsSL "$NODE_PROXY_RAW_BASE/haproxy.cfg.template" -o /tmp/haproxy.cfg.template
+        sed -e "s|@ADMIN_HOST@|${ADMIN_HOST}|g" \
+            -e "s|@MGMT_USERNAME@|${MGMT_USERNAME}|g" \
+            -e "s|@MGMT_PASSWORD@|${MGMT_PASSWORD}|g" \
+            /tmp/haproxy.cfg.template | sudo tee "$MOUNT_DIR/haproxy.cfg" >/dev/null
+        echo "[*] Rendered $MOUNT_DIR/haproxy.cfg from the template"
+    else
+        echo "[*] Keeping the existing $MOUNT_DIR/haproxy.cfg (live DPA config)"
+    fi
 
     echo "[*] Starting node-proxy container..."
     sudo docker rm -f node-proxy >/dev/null 2>&1 || true
