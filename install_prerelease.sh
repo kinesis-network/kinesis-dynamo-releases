@@ -537,26 +537,48 @@ if [ -f "$PROXY_DIR/proxy.env" ]; then
     fi
 fi
 
-# Write Stator's config and start it -- on every node. Stator deliberately
-# does not parse dynamo's config.json (that schema is dynamo's to change);
-# stator.json is the whole contract. Kept across tokenless re-runs, mirroring
-# --init's identity semantics.
+# Write Stator's config -- on every node, on every run. It is derived from
+# dynamo's config.json (written by `noded --init`), which is the source of
+# truth for the node identity and the manager-manager list: nodes provisioned
+# before node.key was the default keep their wallet at another path, and a
+# Stator pointed at a missing file refuses to start rather than mint a second
+# identity the Node Manager has never seen. Stator itself still does not parse
+# config.json (that schema is dynamo's to change); the derivation happens
+# here, once, and stator.json stays the whole contract. Keys already present
+# in stator.json that are not derived here (operator overrides such as
+# poll_interval_sec) are preserved.
 STATOR_CONFIG="$INSTALL_ROOT/stator.json"
-if [ -n "$PROVISION_TOKEN" ] || [ ! -f "$STATOR_CONFIG" ]; then
-    MM_LIST="${PROVISION_TOKEN#*@}"
-    [ "$MM_LIST" = "$PROVISION_TOKEN" ] && MM_LIST=""
-    sudo -u "$SERVICE_USER" jq -n \
+MM_LIST="${PROVISION_TOKEN#*@}"
+[ "$MM_LIST" = "$PROVISION_TOKEN" ] && MM_LIST=""
+DYNAMO_JSON="{}"
+[ -f "$CONFIG_PATH" ] && DYNAMO_JSON=$(sudo -u "$SERVICE_USER" cat "$CONFIG_PATH")
+STATOR_JSON="{}"
+[ -f "$STATOR_CONFIG" ] && STATOR_JSON=$(sudo -u "$SERVICE_USER" cat "$STATOR_CONFIG")
+if NEW_STATOR_JSON=$(printf '%s' "$STATOR_JSON" | sudo -u "$SERVICE_USER" jq \
+        --argjson dynamo "$DYNAMO_JSON" \
         --arg universe "$UNIVERSE" \
         --arg ssh_user "$SERVICE_USER" \
         --arg wallet "$INSTALL_ROOT/node.key" \
         --arg admin_key "$INSTALL_ROOT/admin-ssh.pub" \
         --arg mm "$MM_LIST" \
-        '{universe: $universe, ssh_user: $ssh_user,
-          key_manager: {type: "plaintext", wallet_file: $wallet},
-          admin_ssh_key_file: $admin_key}
-         + (if $mm != "" then {mm_list: ($mm | split("@"))} else {} end)' \
-        | sudo -u "$SERVICE_USER" tee "$STATOR_CONFIG" > /dev/null
+        '. + {universe: ($dynamo.universe // $universe),
+              ssh_user: $ssh_user,
+              key_manager: ($dynamo.key_manager // {type: "plaintext", wallet_file: $wallet}),
+              admin_ssh_key_file: $admin_key}
+         + (if $dynamo.mm_list then {mm_list: $dynamo.mm_list}
+            elif $mm != "" then {mm_list: ($mm | split("@"))}
+            else {} end)'); then
+    printf '%s\n' "$NEW_STATOR_JSON" | sudo -u "$SERVICE_USER" tee "$STATOR_CONFIG" > /dev/null
     echo "[*] Wrote $STATOR_CONFIG"
+else
+    echo "[WARN] Cannot derive $STATOR_CONFIG from $CONFIG_PATH; keeping the existing one"
+fi
+# A stray node.key beside a differently named wallet is what an earlier Stator
+# left behind when it minted an identity of its own. Nothing reads it any
+# more; flag it so an operator can remove it deliberately.
+STATOR_WALLET=$(printf '%s' "$NEW_STATOR_JSON" | jq -r '.key_manager.wallet_file // ""' 2>/dev/null || true)
+if [ -n "$STATOR_WALLET" ] && [ "$STATOR_WALLET" != "$INSTALL_ROOT/node.key" ] && [ -f "$INSTALL_ROOT/node.key" ]; then
+    echo "[WARN] $INSTALL_ROOT/node.key exists but the node identity is $STATOR_WALLET; the stray file is unused"
 fi
 echo "[*] Starting stator..."
 sudo systemctl restart "$STATOR_SERVICE"
