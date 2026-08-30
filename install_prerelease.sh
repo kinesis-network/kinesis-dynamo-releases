@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.1-beta4
+# Kinesis Dynamo Bootstrap Script: v0.4.2-beta1
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -355,6 +355,23 @@ if [ "$ENABLE_DYNAMO_EXPLICIT" = "false" ]; then
 elif [ -n "$ENABLE_DYNAMO_EXPLICIT" ]; then
     sudo rm -f "$INSTALL_ROOT/dynamo.disabled"
 fi
+# The marker is the single source of truth for the firewall, written (or
+# removed) by `noded --init` when it redeems a token, and reconciled into
+# plugins.docker.firewall_addr in config.json on every init. Below it only
+# decides whether the systemd unit runs.
+FIREWALL_MARKER="${INSTALL_ROOT}/firewall.enabled"
+# App proxies never run the firewall (kinesis-firewall isn't integrated with
+# the proxy service yet). Init leaves the marker absent for a proxy token, but
+# a proxy provisioned by an older release still carries one, and a re-install
+# runs init without a token, which keeps the marker as is. Drop it here so
+# init's reconcile step strips firewall_addr from config.json to match (dynamo
+# otherwise keeps dialing a firewall socket that is never there). proxy.env
+# only exists on an already-provisioned proxy; a fresh proxy install is handled
+# by init itself.
+if [ -f "$PROXY_DIR/proxy.env" ] && [ -f "$FIREWALL_MARKER" ]; then
+    echo "[*] App proxy: removing stale firewall marker."
+    sudo rm -f "$FIREWALL_MARKER"
+fi
 sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --lb-pool="${LB_POOL}" --public-ip="${PUBLIC_IP}" --enable-dynamo="${ENABLE_DYNAMO}" $TEST_ARG
 
 # The redeemed token's initial_state may have just disabled dynamo (recorded
@@ -395,11 +412,6 @@ if [ -z "$CURRENT_CSP" ]; then
             "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && sudo -u "$SERVICE_USER" mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
     fi
 fi
-
-# The marker is the single source of truth for the firewall, written (or removed)
-# by `noded --init`, which also reconciles plugins.docker.firewall_addr in
-# config.json against it. Here it only decides whether the systemd unit runs.
-FIREWALL_MARKER="${INSTALL_ROOT}/firewall.enabled"
 
 # --- 7. Systemd Integration ---
 echo "[*] Configuring systemd services..."
@@ -455,12 +467,10 @@ else
     sudo systemctl enable $CORE_SERVICES
 fi
 
-# Enable the firewall only when init marked this node for it (non-VPN nodes; the
-# marker is written by `noded --init`, absent for VPN nodes) AND this is not an
-# app proxy. kinesis-firewall isn't integrated with the proxy service yet
-# (frontend rules would need to sync with the firewall), so proxy nodes keep
-# dynamo-firewall disabled even though they are non-VPN.
-if [ -f "$FIREWALL_MARKER" ] && [ ! -f "$PROXY_DIR/proxy.env" ]; then
+# Enable the firewall only when init marked this node for it. The marker is
+# absent for VPN nodes, dynamoless nodes and app proxies (see the init step
+# above), so the unit, the marker and firewall_addr in config.json always agree.
+if [ -f "$FIREWALL_MARKER" ]; then
     ENABLE_FIREWALL=true
 else
     ENABLE_FIREWALL=false
@@ -491,7 +501,29 @@ if [ -f "$PROXY_DIR/proxy.env" ]; then
     WILDCARD_CERT_FILE="star_apps_kinesiscloud_com.pem"
 
     sudo mkdir -p "$CERTS_DIR" "$MOUNT_DIR" "$PROXY_DIR/general" "$PROXY_DIR/logs"
-    sudo cp "$PROXY_DIR/$CERT_FILE" "$CERTS_DIR/$WILDCARD_CERT_FILE"
+
+    # The installed wildcard has two writers: the bundle here, and the runtime
+    # manager's cert distribution, which rewrites the same file through the Data
+    # Plane API on every renewal. `noded --init` above refreshes the bundle from
+    # the manager on every run, but that refresh is best-effort, and a proxy from
+    # an older release still carries its provision-time bundle. Installing that
+    # over a renewed cert rolled proxies back to an expired wildcard on
+    # self-upgrade (2026-08-09), invisibly to the manager, which only tracks its
+    # own uploads. So the bundle is installed only when it outlives what is on
+    # disk; a file that does not parse counts as expired.
+    cert_not_after() {
+        local end
+        end=$(sudo openssl x509 -noout -enddate -in "$1" 2>/dev/null | cut -d= -f2)
+        [ -n "$end" ] && date -d "$end" +%s 2>/dev/null || echo 0
+    }
+    BUNDLE_NOT_AFTER=$(cert_not_after "$PROXY_DIR/$CERT_FILE")
+    INSTALLED_NOT_AFTER=$(cert_not_after "$CERTS_DIR/$WILDCARD_CERT_FILE")
+    if [ "$BUNDLE_NOT_AFTER" -gt "$INSTALLED_NOT_AFTER" ]; then
+        echo "[*] Installing the wildcard cert from the bundle (expires $(date -u -d @"$BUNDLE_NOT_AFTER" +%FT%TZ))"
+        sudo cp "$PROXY_DIR/$CERT_FILE" "$CERTS_DIR/$WILDCARD_CERT_FILE"
+    else
+        echo "[*] Keeping the installed wildcard cert (expires $(date -u -d @"$INSTALLED_NOT_AFTER" +%FT%TZ)); the bundle's is not newer"
+    fi
 
     # dataplaneapi.yml is static and always refreshed. haproxy.cfg is NOT: the
     # mounted file is the DataPlane API's live config (dataplaneapi.yml
