@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.5
+# Kinesis Dynamo Bootstrap Script: v0.4.6
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -76,235 +76,6 @@ sudo apt-get install -y jq curl gnupg lsb-release libarchive-tools pciutils
 
 sudo usermod -aG systemd-journal "$SERVICE_USER"
 
-# The whole container-runtime section is skipped wholesale on a dynamoless
-# node: none of it belongs there, and mutating Docker config on a BYOD machine
-# can break things the owner runs themselves.
-if [ "$ENABLE_DYNAMO" = false ]; then
-    echo "[*] Dynamo disabled: skipping container runtime setup (Docker/NVIDIA)"
-else
-
-# Docker Setup
-if ! command -v docker >/dev/null 2>&1; then
-    echo "[*] Installing Docker..."
-    sudo install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor --batch --yes -o /etc/apt/keyrings/docker.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | \
-        sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-    sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io
-fi
-
-sudo systemctl enable --now docker
-sudo usermod -aG docker "$SERVICE_USER"
-
-# --- 3.4. Keep containers alive across daemon restarts ---
-# Docker's default is to SIGKILL every running container when dockerd stops, so
-# any `systemctl restart docker` below -- or an unrelated daemon upgrade months
-# from now -- takes the node's entire workload down with it.  Nothing brings it
-# back either: dynamo creates containers with no restart policy, and its app
-# keeper only re-runs gateway containers, so the rest sit Exited until the
-# runtime manager happens to issue an order.  live-restore leaves them running
-# while the daemon is away.
-#
-# Applied with `reload` (SIGHUP) rather than `restart`: live-restore is one of
-# the options dockerd re-reads on reload, so turning it on does not cost the
-# very outage it exists to prevent.
-#
-# Two things it does not cover, both acceptable here: it is unsupported under
-# swarm mode (unused on these nodes), and it does not carry containers across a
-# restart that changes daemon options such as data-root -- see 3.5, where such
-# a change is real and rare.
-DAEMON_JSON="/etc/docker/daemon.json"
-sudo mkdir -p /etc/docker
-if [ ! -s "$DAEMON_JSON" ]; then
-    echo '{}' | sudo tee "$DAEMON_JSON" > /dev/null
-fi
-if [ "$(sudo jq -r '."live-restore" // false' "$DAEMON_JSON")" = "true" ]; then
-    echo "[*] Docker live-restore already enabled"
-else
-    echo "[*] Enabling Docker live-restore so containers survive daemon restarts"
-    sudo jq '. + {"live-restore": true}' "$DAEMON_JSON" | sudo tee "$DAEMON_JSON.tmp" > /dev/null
-    sudo mv "$DAEMON_JSON.tmp" "$DAEMON_JSON"
-    if ! sudo systemctl reload docker; then
-        echo "[!] Could not reload docker; live-restore takes effect on its next restart"
-    fi
-fi
-
-# --- 3.5. Optional: Relocate Docker data-root ---
-# When DOCKER_DATA_ROOT is set, point Docker at it instead of the default
-# /var/lib/docker. Two pieces:
-#   1. /etc/docker/daemon.json gets data-root merged in via jq, so we
-#      preserve any existing daemon settings (e.g. nvidia runtime).
-#   2. If the data-root lives on a separately-mounted filesystem (cloud
-#      ephemeral disks that mount late via cloud-init, attached NVMe,
-#      etc.), drop a docker.service unit override with
-#      RequiresMountsFor=<mount> so docker waits for the mount on every
-#      boot. Without this, on reboots where the mount comes up late
-#      docker starts first, finds its data-root path missing, and either
-#      falls back to / or mkdirs into the empty mountpoint dir which
-#      gets shadowed when the real filesystem mounts. The mount is
-#      derived from `df` so the caller only needs to set
-#      DOCKER_DATA_ROOT.
-# Existing data under /var/lib/docker is NOT migrated automatically; if
-# you care about preserving images/volumes, rsync them across before
-# re-running.
-if [ -n "$DOCKER_DATA_ROOT" ]; then
-    echo "[*] Configuring Docker data-root: $DOCKER_DATA_ROOT"
-    sudo mkdir -p "$DOCKER_DATA_ROOT"
-    NEED_RESTART=false
-    CURRENT_ROOT=$(sudo jq -r '."data-root" // ""' "$DAEMON_JSON")
-    if [ "$CURRENT_ROOT" != "$DOCKER_DATA_ROOT" ]; then
-        sudo jq --arg dr "$DOCKER_DATA_ROOT" '. + {"data-root": $dr}' "$DAEMON_JSON" \
-            | sudo tee "$DAEMON_JSON.tmp" > /dev/null
-        sudo mv "$DAEMON_JSON.tmp" "$DAEMON_JSON"
-        echo "[*] Wrote data-root to $DAEMON_JSON"
-        NEED_RESTART=true
-    else
-        echo "[*] Docker data-root already set to $DOCKER_DATA_ROOT in $DAEMON_JSON"
-    fi
-    DROPIN_DIR="/etc/systemd/system/docker.service.d"
-    DROPIN_FILE="$DROPIN_DIR/wait-for-data-root.conf"
-    DATA_ROOT_MOUNT=$(df --output=target "$DOCKER_DATA_ROOT" 2>/dev/null | tail -n1 | tr -d '[:space:]')
-    if [ -n "$DATA_ROOT_MOUNT" ] && [ "$DATA_ROOT_MOUNT" != "/" ]; then
-        DESIRED=$(printf '[Unit]\nRequiresMountsFor=%s\n' "$DATA_ROOT_MOUNT")
-        if [ ! -f "$DROPIN_FILE" ] || [ "$(sudo cat "$DROPIN_FILE")" != "$DESIRED" ]; then
-            echo "[*] data-root lives on $DATA_ROOT_MOUNT; ordering docker.service after the mount"
-            sudo mkdir -p "$DROPIN_DIR"
-            printf '%s\n' "$DESIRED" | sudo tee "$DROPIN_FILE" > /dev/null
-            sudo systemctl daemon-reload
-            NEED_RESTART=true
-        else
-            echo "[*] docker.service already waits for $DATA_ROOT_MOUNT (dropin up to date)"
-        fi
-    elif [ -f "$DROPIN_FILE" ]; then
-        echo "[*] data-root is on /; removing stale $DROPIN_FILE"
-        sudo rm -f "$DROPIN_FILE"
-        sudo systemctl daemon-reload
-        NEED_RESTART=true
-    fi
-    if [ "$NEED_RESTART" = true ]; then
-        echo "[*] Restarting docker to apply data-root / unit changes..."
-        sudo systemctl restart docker
-    fi
-fi
-
-# --- 3.6. Optional: Relocate containerd root ---
-# When CONTAINERD_ROOT is set, point the system containerd at it instead of
-# the default /var/lib/containerd. dockerd talks to the system containerd
-# over /run/containerd/containerd.sock, and depending on the engine version
-# and snapshotter choice (e.g. features.containerd-snapshotter), image
-# content can land under /var/lib/containerd rather than /var/lib/docker.
-# Same shape as 3.5:
-#   1. Edit /etc/containerd/config.toml so the top-level "root = ..." key
-#      points at $CONTAINERD_ROOT. We delete any existing top-level root
-#      line (commented or not) and insert a fresh one so we never end up
-#      with a TOML duplicate key.
-#   2. Drop a containerd.service unit override with RequiresMountsFor=<mount>
-#      to fix the same reboot race as docker. Since docker.service has
-#      Requires=containerd.service, this implicitly orders docker after
-#      the mount too.
-if [ -n "$CONTAINERD_ROOT" ]; then
-    echo "[*] Configuring containerd root: $CONTAINERD_ROOT"
-    sudo mkdir -p "$CONTAINERD_ROOT" /etc/containerd
-
-    CONTAINERD_CONFIG="/etc/containerd/config.toml"
-    if [ ! -s "$CONTAINERD_CONFIG" ]; then
-        echo "[*] No existing $CONTAINERD_CONFIG; generating defaults"
-        sudo containerd config default | sudo tee "$CONTAINERD_CONFIG" > /dev/null
-    fi
-
-    NEED_RESTART_CTRD=false
-    CURRENT_CTRD_ROOT=$(grep -E '^root[[:space:]]*=' "$CONTAINERD_CONFIG" | head -n1 \
-        | sed -E 's/^root[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/')
-    if [ "$CURRENT_CTRD_ROOT" != "$CONTAINERD_ROOT" ]; then
-        # Drop every top-level "root = " line (commented or not). The leading
-        # ^ anchors to column 0 so we don't touch nested "root" subkeys inside
-        # plugin tables, which are always indented.
-        sudo sed -i -E '/^#?root[[:space:]]*=/d' "$CONTAINERD_CONFIG"
-        if grep -qE '^version[[:space:]]*=' "$CONTAINERD_CONFIG"; then
-            sudo sed -i -E "/^version[[:space:]]*=/a root = \"$CONTAINERD_ROOT\"" "$CONTAINERD_CONFIG"
-        else
-            sudo sed -i -E "1i root = \"$CONTAINERD_ROOT\"" "$CONTAINERD_CONFIG"
-        fi
-        echo "[*] Set root = \"$CONTAINERD_ROOT\" in $CONTAINERD_CONFIG"
-        NEED_RESTART_CTRD=true
-    else
-        echo "[*] containerd root already set to $CONTAINERD_ROOT in $CONTAINERD_CONFIG"
-    fi
-
-    CTRD_DROPIN_DIR="/etc/systemd/system/containerd.service.d"
-    CTRD_DROPIN_FILE="$CTRD_DROPIN_DIR/wait-for-root.conf"
-    CTRD_MOUNT=$(df --output=target "$CONTAINERD_ROOT" 2>/dev/null | tail -n1 | tr -d '[:space:]')
-    if [ -n "$CTRD_MOUNT" ] && [ "$CTRD_MOUNT" != "/" ]; then
-        CTRD_DESIRED=$(printf '[Unit]\nRequiresMountsFor=%s\n' "$CTRD_MOUNT")
-        if [ ! -f "$CTRD_DROPIN_FILE" ] || [ "$(sudo cat "$CTRD_DROPIN_FILE")" != "$CTRD_DESIRED" ]; then
-            echo "[*] containerd root lives on $CTRD_MOUNT; ordering containerd.service after the mount"
-            sudo mkdir -p "$CTRD_DROPIN_DIR"
-            printf '%s\n' "$CTRD_DESIRED" | sudo tee "$CTRD_DROPIN_FILE" > /dev/null
-            sudo systemctl daemon-reload
-            NEED_RESTART_CTRD=true
-        else
-            echo "[*] containerd.service already waits for $CTRD_MOUNT (dropin up to date)"
-        fi
-    elif [ -f "$CTRD_DROPIN_FILE" ]; then
-        echo "[*] containerd root is on /; removing stale $CTRD_DROPIN_FILE"
-        sudo rm -f "$CTRD_DROPIN_FILE"
-        sudo systemctl daemon-reload
-        NEED_RESTART_CTRD=true
-    fi
-
-    if [ "$NEED_RESTART_CTRD" = true ]; then
-        # docker.service Requires=containerd.service, so restarting containerd
-        # alone leaves docker with a stale connection. Bounce both, in order.
-        echo "[*] Restarting containerd (and docker, which depends on it)..."
-        sudo systemctl restart containerd
-        sudo systemctl restart docker
-    fi
-fi
-
-# --- 4. GPU Detection & Toolkit ---
-HAS_NVIDIA_GPU=false
-if [ "$IS_WSL" = true ]; then
-    [ -f "/usr/lib/wsl/lib/nvidia-smi" ] && HAS_NVIDIA_GPU=true
-else
-    lspci | grep -qi nvidia && HAS_NVIDIA_GPU=true
-fi
-
-if [ "$HAS_NVIDIA_GPU" = true ]; then
-    echo "[*] NVIDIA GPU detected. Setting up Container Toolkit..."
-    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor --batch --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-        sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-    sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
-    # `nvidia-ctk runtime configure` is idempotent, but restarting docker to
-    # pick it up is not.  Re-running this script to upgrade an existing GPU
-    # node hits this line with the runtime already registered and the daemon
-    # already running it, where the restart buys nothing and costs every
-    # running container on the node.  So restart only when the daemon's actual
-    # state disagrees with the file: either we just changed it, or a daemon
-    # older than the file never loaded it.
-    #
-    # Compared as canonical JSON (jq -S: keys sorted, whitespace normalized)
-    # rather than as bytes.  nvidia-ctk rewrites daemon.json in its own
-    # formatting whenever it finds it written in someone else's -- 3.4 above
-    # writes it with jq, so a byte comparison reports a change on a file whose
-    # meaning is identical, and restarts for nothing.
-    NVIDIA_CFG_BEFORE=$(sudo jq -S . "$DAEMON_JSON" 2>/dev/null || echo "")
-    sudo nvidia-ctk runtime configure --runtime=docker
-    NVIDIA_CFG_AFTER=$(sudo jq -S . "$DAEMON_JSON" 2>/dev/null || echo "")
-    if [ "$NVIDIA_CFG_BEFORE" != "$NVIDIA_CFG_AFTER" ]; then
-        echo "[*] Registered the nvidia runtime; restarting docker to load it"
-        sudo systemctl restart docker
-    elif ! sudo docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'; then
-        echo "[*] Docker is not running the nvidia runtime yet; restarting"
-        sudo systemctl restart docker
-    else
-        echo "[*] Docker already runs the nvidia runtime; skipping restart"
-    fi
-fi
-
-fi # ENABLE_DYNAMO: end of the container-runtime setup
-
 # --- 4.5 Stop existing services if they exist ---
 echo "[*] Checking for existing services..."
 for svc in $DYNAMO_SERVICES $STATOR_SERVICE; do
@@ -375,12 +146,247 @@ fi
 sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --lb-pool="${LB_POOL}" --public-ip="${PUBLIC_IP}" --enable-dynamo="${ENABLE_DYNAMO}" $TEST_ARG
 
 # The redeemed token's initial_state may have just disabled dynamo (recorded
-# in the marker by --init). Honor it in this same run: the container runtime
-# was already installed above, which is harmless, but the wrong agent must not
-# be enabled below. An explicit ENABLE_DYNAMO from the caller still wins.
+# in the marker by --init). Honor it in this same run: it decides whether the
+# container runtime is installed below and which agent is enabled after that.
+# An explicit ENABLE_DYNAMO from the caller still wins.
 if [ -z "$ENABLE_DYNAMO_EXPLICIT" ] && [ -f "$INSTALL_ROOT/dynamo.disabled" ]; then
     ENABLE_DYNAMO=false
 fi
+
+# The whole container-runtime section is skipped wholesale on a dynamoless
+# node: none of it belongs there, and mutating Docker config on a BYOD machine
+# can break things the owner runs themselves. It runs after `noded --init` on
+# purpose: the redeemed token's initial_state is what decides the posture for
+# a token-driven install, so the caller need not pass ENABLE_DYNAMO=false
+# alongside the token. Nothing before this point needs Docker -- the release
+# download and init are plain files and a gRPC call -- and the dynamo units
+# that do are enabled and started further down.
+if [ "$ENABLE_DYNAMO" = false ]; then
+    echo "[*] Dynamo disabled: skipping container runtime setup (Docker/NVIDIA)"
+else
+
+# --- 6.5. Container Runtime (Docker/NVIDIA) ---
+# Docker Setup
+if ! command -v docker >/dev/null 2>&1; then
+    echo "[*] Installing Docker..."
+    sudo install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor --batch --yes -o /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | \
+        sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+    sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+fi
+
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$SERVICE_USER"
+
+# --- 6.6. Keep containers alive across daemon restarts ---
+# Docker's default is to SIGKILL every running container when dockerd stops, so
+# any `systemctl restart docker` below -- or an unrelated daemon upgrade months
+# from now -- takes the node's entire workload down with it.  Nothing brings it
+# back either: dynamo creates containers with no restart policy, and its app
+# keeper only re-runs gateway containers, so the rest sit Exited until the
+# runtime manager happens to issue an order.  live-restore leaves them running
+# while the daemon is away.
+#
+# Applied with `reload` (SIGHUP) rather than `restart`: live-restore is one of
+# the options dockerd re-reads on reload, so turning it on does not cost the
+# very outage it exists to prevent.
+#
+# Two things it does not cover, both acceptable here: it is unsupported under
+# swarm mode (unused on these nodes), and it does not carry containers across a
+# restart that changes daemon options such as data-root -- see 6.7, where such
+# a change is real and rare.
+DAEMON_JSON="/etc/docker/daemon.json"
+sudo mkdir -p /etc/docker
+if [ ! -s "$DAEMON_JSON" ]; then
+    echo '{}' | sudo tee "$DAEMON_JSON" > /dev/null
+fi
+if [ "$(sudo jq -r '."live-restore" // false' "$DAEMON_JSON")" = "true" ]; then
+    echo "[*] Docker live-restore already enabled"
+else
+    echo "[*] Enabling Docker live-restore so containers survive daemon restarts"
+    sudo jq '. + {"live-restore": true}' "$DAEMON_JSON" | sudo tee "$DAEMON_JSON.tmp" > /dev/null
+    sudo mv "$DAEMON_JSON.tmp" "$DAEMON_JSON"
+    if ! sudo systemctl reload docker; then
+        echo "[!] Could not reload docker; live-restore takes effect on its next restart"
+    fi
+fi
+
+# --- 6.7. Optional: Relocate Docker data-root ---
+# When DOCKER_DATA_ROOT is set, point Docker at it instead of the default
+# /var/lib/docker. Two pieces:
+#   1. /etc/docker/daemon.json gets data-root merged in via jq, so we
+#      preserve any existing daemon settings (e.g. nvidia runtime).
+#   2. If the data-root lives on a separately-mounted filesystem (cloud
+#      ephemeral disks that mount late via cloud-init, attached NVMe,
+#      etc.), drop a docker.service unit override with
+#      RequiresMountsFor=<mount> so docker waits for the mount on every
+#      boot. Without this, on reboots where the mount comes up late
+#      docker starts first, finds its data-root path missing, and either
+#      falls back to / or mkdirs into the empty mountpoint dir which
+#      gets shadowed when the real filesystem mounts. The mount is
+#      derived from `df` so the caller only needs to set
+#      DOCKER_DATA_ROOT.
+# Existing data under /var/lib/docker is NOT migrated automatically; if
+# you care about preserving images/volumes, rsync them across before
+# re-running.
+if [ -n "$DOCKER_DATA_ROOT" ]; then
+    echo "[*] Configuring Docker data-root: $DOCKER_DATA_ROOT"
+    sudo mkdir -p "$DOCKER_DATA_ROOT"
+    NEED_RESTART=false
+    CURRENT_ROOT=$(sudo jq -r '."data-root" // ""' "$DAEMON_JSON")
+    if [ "$CURRENT_ROOT" != "$DOCKER_DATA_ROOT" ]; then
+        sudo jq --arg dr "$DOCKER_DATA_ROOT" '. + {"data-root": $dr}' "$DAEMON_JSON" \
+            | sudo tee "$DAEMON_JSON.tmp" > /dev/null
+        sudo mv "$DAEMON_JSON.tmp" "$DAEMON_JSON"
+        echo "[*] Wrote data-root to $DAEMON_JSON"
+        NEED_RESTART=true
+    else
+        echo "[*] Docker data-root already set to $DOCKER_DATA_ROOT in $DAEMON_JSON"
+    fi
+    DROPIN_DIR="/etc/systemd/system/docker.service.d"
+    DROPIN_FILE="$DROPIN_DIR/wait-for-data-root.conf"
+    DATA_ROOT_MOUNT=$(df --output=target "$DOCKER_DATA_ROOT" 2>/dev/null | tail -n1 | tr -d '[:space:]')
+    if [ -n "$DATA_ROOT_MOUNT" ] && [ "$DATA_ROOT_MOUNT" != "/" ]; then
+        DESIRED=$(printf '[Unit]\nRequiresMountsFor=%s\n' "$DATA_ROOT_MOUNT")
+        if [ ! -f "$DROPIN_FILE" ] || [ "$(sudo cat "$DROPIN_FILE")" != "$DESIRED" ]; then
+            echo "[*] data-root lives on $DATA_ROOT_MOUNT; ordering docker.service after the mount"
+            sudo mkdir -p "$DROPIN_DIR"
+            printf '%s\n' "$DESIRED" | sudo tee "$DROPIN_FILE" > /dev/null
+            sudo systemctl daemon-reload
+            NEED_RESTART=true
+        else
+            echo "[*] docker.service already waits for $DATA_ROOT_MOUNT (dropin up to date)"
+        fi
+    elif [ -f "$DROPIN_FILE" ]; then
+        echo "[*] data-root is on /; removing stale $DROPIN_FILE"
+        sudo rm -f "$DROPIN_FILE"
+        sudo systemctl daemon-reload
+        NEED_RESTART=true
+    fi
+    if [ "$NEED_RESTART" = true ]; then
+        echo "[*] Restarting docker to apply data-root / unit changes..."
+        sudo systemctl restart docker
+    fi
+fi
+
+# --- 6.8. Optional: Relocate containerd root ---
+# When CONTAINERD_ROOT is set, point the system containerd at it instead of
+# the default /var/lib/containerd. dockerd talks to the system containerd
+# over /run/containerd/containerd.sock, and depending on the engine version
+# and snapshotter choice (e.g. features.containerd-snapshotter), image
+# content can land under /var/lib/containerd rather than /var/lib/docker.
+# Same shape as 6.7:
+#   1. Edit /etc/containerd/config.toml so the top-level "root = ..." key
+#      points at $CONTAINERD_ROOT. We delete any existing top-level root
+#      line (commented or not) and insert a fresh one so we never end up
+#      with a TOML duplicate key.
+#   2. Drop a containerd.service unit override with RequiresMountsFor=<mount>
+#      to fix the same reboot race as docker. Since docker.service has
+#      Requires=containerd.service, this implicitly orders docker after
+#      the mount too.
+if [ -n "$CONTAINERD_ROOT" ]; then
+    echo "[*] Configuring containerd root: $CONTAINERD_ROOT"
+    sudo mkdir -p "$CONTAINERD_ROOT" /etc/containerd
+
+    CONTAINERD_CONFIG="/etc/containerd/config.toml"
+    if [ ! -s "$CONTAINERD_CONFIG" ]; then
+        echo "[*] No existing $CONTAINERD_CONFIG; generating defaults"
+        sudo containerd config default | sudo tee "$CONTAINERD_CONFIG" > /dev/null
+    fi
+
+    NEED_RESTART_CTRD=false
+    CURRENT_CTRD_ROOT=$(grep -E '^root[[:space:]]*=' "$CONTAINERD_CONFIG" | head -n1 \
+        | sed -E 's/^root[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/')
+    if [ "$CURRENT_CTRD_ROOT" != "$CONTAINERD_ROOT" ]; then
+        # Drop every top-level "root = " line (commented or not). The leading
+        # ^ anchors to column 0 so we don't touch nested "root" subkeys inside
+        # plugin tables, which are always indented.
+        sudo sed -i -E '/^#?root[[:space:]]*=/d' "$CONTAINERD_CONFIG"
+        if grep -qE '^version[[:space:]]*=' "$CONTAINERD_CONFIG"; then
+            sudo sed -i -E "/^version[[:space:]]*=/a root = \"$CONTAINERD_ROOT\"" "$CONTAINERD_CONFIG"
+        else
+            sudo sed -i -E "1i root = \"$CONTAINERD_ROOT\"" "$CONTAINERD_CONFIG"
+        fi
+        echo "[*] Set root = \"$CONTAINERD_ROOT\" in $CONTAINERD_CONFIG"
+        NEED_RESTART_CTRD=true
+    else
+        echo "[*] containerd root already set to $CONTAINERD_ROOT in $CONTAINERD_CONFIG"
+    fi
+
+    CTRD_DROPIN_DIR="/etc/systemd/system/containerd.service.d"
+    CTRD_DROPIN_FILE="$CTRD_DROPIN_DIR/wait-for-root.conf"
+    CTRD_MOUNT=$(df --output=target "$CONTAINERD_ROOT" 2>/dev/null | tail -n1 | tr -d '[:space:]')
+    if [ -n "$CTRD_MOUNT" ] && [ "$CTRD_MOUNT" != "/" ]; then
+        CTRD_DESIRED=$(printf '[Unit]\nRequiresMountsFor=%s\n' "$CTRD_MOUNT")
+        if [ ! -f "$CTRD_DROPIN_FILE" ] || [ "$(sudo cat "$CTRD_DROPIN_FILE")" != "$CTRD_DESIRED" ]; then
+            echo "[*] containerd root lives on $CTRD_MOUNT; ordering containerd.service after the mount"
+            sudo mkdir -p "$CTRD_DROPIN_DIR"
+            printf '%s\n' "$CTRD_DESIRED" | sudo tee "$CTRD_DROPIN_FILE" > /dev/null
+            sudo systemctl daemon-reload
+            NEED_RESTART_CTRD=true
+        else
+            echo "[*] containerd.service already waits for $CTRD_MOUNT (dropin up to date)"
+        fi
+    elif [ -f "$CTRD_DROPIN_FILE" ]; then
+        echo "[*] containerd root is on /; removing stale $CTRD_DROPIN_FILE"
+        sudo rm -f "$CTRD_DROPIN_FILE"
+        sudo systemctl daemon-reload
+        NEED_RESTART_CTRD=true
+    fi
+
+    if [ "$NEED_RESTART_CTRD" = true ]; then
+        # docker.service Requires=containerd.service, so restarting containerd
+        # alone leaves docker with a stale connection. Bounce both, in order.
+        echo "[*] Restarting containerd (and docker, which depends on it)..."
+        sudo systemctl restart containerd
+        sudo systemctl restart docker
+    fi
+fi
+
+# --- 6.9. GPU Detection & Toolkit ---
+HAS_NVIDIA_GPU=false
+if [ "$IS_WSL" = true ]; then
+    [ -f "/usr/lib/wsl/lib/nvidia-smi" ] && HAS_NVIDIA_GPU=true
+else
+    lspci | grep -qi nvidia && HAS_NVIDIA_GPU=true
+fi
+
+if [ "$HAS_NVIDIA_GPU" = true ]; then
+    echo "[*] NVIDIA GPU detected. Setting up Container Toolkit..."
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor --batch --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+        sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+    # `nvidia-ctk runtime configure` is idempotent, but restarting docker to
+    # pick it up is not.  Re-running this script to upgrade an existing GPU
+    # node hits this line with the runtime already registered and the daemon
+    # already running it, where the restart buys nothing and costs every
+    # running container on the node.  So restart only when the daemon's actual
+    # state disagrees with the file: either we just changed it, or a daemon
+    # older than the file never loaded it.
+    #
+    # Compared as canonical JSON (jq -S: keys sorted, whitespace normalized)
+    # rather than as bytes.  nvidia-ctk rewrites daemon.json in its own
+    # formatting whenever it finds it written in someone else's -- 6.6 above
+    # writes it with jq, so a byte comparison reports a change on a file whose
+    # meaning is identical, and restarts for nothing.
+    NVIDIA_CFG_BEFORE=$(sudo jq -S . "$DAEMON_JSON" 2>/dev/null || echo "")
+    sudo nvidia-ctk runtime configure --runtime=docker
+    NVIDIA_CFG_AFTER=$(sudo jq -S . "$DAEMON_JSON" 2>/dev/null || echo "")
+    if [ "$NVIDIA_CFG_BEFORE" != "$NVIDIA_CFG_AFTER" ]; then
+        echo "[*] Registered the nvidia runtime; restarting docker to load it"
+        sudo systemctl restart docker
+    elif ! sudo docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'; then
+        echo "[*] Docker is not running the nvidia runtime yet; restarting"
+        sudo systemctl restart docker
+    else
+        echo "[*] Docker already runs the nvidia runtime; skipping restart"
+    fi
+fi
+
+fi # ENABLE_DYNAMO: end of the container-runtime setup
 
 # Detect the cloud provider and patch its metadata into the config, but only
 # when it is not recorded yet, so re-running install.sh on an existing node
