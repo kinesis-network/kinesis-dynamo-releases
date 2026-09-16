@@ -649,11 +649,9 @@ if [ "$ENABLE_DYNAMO" = true ]; then
 fi
 
 # --- 8. Verification ---
-if [ "$ENABLE_DYNAMO" = false ]; then
-    output=$("${INSTALL_ROOT}/stator" --version 2>/dev/null)
-else
-    output=$(sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --version --config="$CONFIG_PATH" 2>/dev/null)
-fi
+# Stator runs on every node and shares dynamo's identity, so it reports the
+# build and the node address for both node types.
+output=$(sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/stator" --version --config="$STATOR_CONFIG" 2>/dev/null)
 rc=$?
 if [ "$rc" -ne 0 ]; then
     echo "[FAIL] Dynamo installation failed"
