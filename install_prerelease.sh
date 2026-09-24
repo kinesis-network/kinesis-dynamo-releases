@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.8-beta1
+# Kinesis Dynamo Bootstrap Script: v0.4.8-beta2
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -609,7 +609,10 @@ fi
 # config.json at the socket the container serves under /var/run/tetragon. The
 # container is recreated on every run so a re-install picks up the latest
 # image, as node-proxy is. It starts before dynamo, whose tetragon stream
-# retries until the socket is up either way.
+# retries until the socket is up either way. SOCKET_GID has the container's
+# entrypoint chown the socket to root:<service user's group>, mode 660: the
+# Tetragon API is unauthenticated and can load enforcer policies, so it is
+# reachable only by dynamo's user, not by every local account.
 SENTINEL_MARKER="$INSTALL_ROOT/sentinel.enabled"
 SENTINEL_REPO="$SENTINEL_IMAGE"
 case "${SENTINEL_IMAGE##*/}" in *:*) SENTINEL_REPO="${SENTINEL_IMAGE%:*}" ;; esac
@@ -647,6 +650,7 @@ if [ "$ENABLE_DYNAMO" = true ] && [ -f "$SENTINEL_MARKER" ]; then
             --ipc=host \
             --cgroupns=host \
             --privileged \
+            -e SOCKET_GID="$(id -g "$SERVICE_USER")" \
             -v /sys/kernel/btf/vmlinux:/var/lib/tetragon/btf \
             -v /sys/kernel/debug:/sys/kernel/debug \
             -v /var/run/docker.sock:/var/run/docker.sock \
