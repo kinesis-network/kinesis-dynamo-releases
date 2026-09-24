@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.7-beta2
+# Kinesis Dynamo Bootstrap Script: v0.4.8-beta1
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -33,6 +33,16 @@ fi
 [ "$ENABLE_DYNAMO" = "false" ] || ENABLE_DYNAMO=true
 DOCKER_DATA_ROOT=${DOCKER_DATA_ROOT:-""}
 CONTAINERD_ROOT=${CONTAINERD_ROOT:-""}
+
+# Whether kinesis-sentinel (Tetragon) runs beside dynamo. The redeemed token's
+# initial_state decides it, and `noded --init` records the decision in a marker
+# (sentinel.enabled), so re-runs keep it without re-passing anything.
+# INSTALL_SENTINEL=true|false overrides the token and the marker, which is how
+# an already-provisioned node is converted without a new token. Never runs on
+# a dynamoless node.
+INSTALL_SENTINEL=${INSTALL_SENTINEL:-""}
+SENTINEL_IMAGE=${SENTINEL_IMAGE:-"kinesisorg/kinesis-sentinel"}
+SENTINEL_CONTAINER="kinesis-sentinel"
 
 # App-proxy provisioning (only used when PROVISION_TOKEN is a proxy token; for a
 # normal node these are empty/unused). LB_POOL / PUBLIC_IP are passed through to
@@ -68,6 +78,7 @@ echo "OS_ARCH=$OS_ARCH"
 echo "DOCKER_DATA_ROOT=${DOCKER_DATA_ROOT:-<default>}"
 echo "CONTAINERD_ROOT=${CONTAINERD_ROOT:-<default>}"
 echo "ENABLE_DYNAMO=$ENABLE_DYNAMO"
+echo "INSTALL_SENTINEL=${INSTALL_SENTINEL:-<token>}"
 
 # --- 3. Install Core Dependencies ---
 echo "[*] Installing system dependencies..."
@@ -143,7 +154,7 @@ if [ -f "$PROXY_DIR/proxy.env" ] && [ -f "$FIREWALL_MARKER" ]; then
     echo "[*] App proxy: removing stale firewall marker."
     sudo rm -f "$FIREWALL_MARKER"
 fi
-sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --lb-pool="${LB_POOL}" --public-ip="${PUBLIC_IP}" --enable-dynamo="${ENABLE_DYNAMO}" $TEST_ARG
+sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --lb-pool="${LB_POOL}" --public-ip="${PUBLIC_IP}" --enable-dynamo="${ENABLE_DYNAMO}" --install-sentinel="${INSTALL_SENTINEL}" $TEST_ARG
 
 # The redeemed token's initial_state may have just disabled dynamo (recorded
 # in the marker by --init). Honor it in this same run: it decides whether the
@@ -589,6 +600,72 @@ if [ -f "$PROXY_DIR/proxy.env" ]; then
         sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --postreg --config="$CONFIG_PATH"
     else
         echo "[WARN] DataplaneAPI did not become healthy; skipping activation (LB stays pending)."
+    fi
+fi
+
+# --- 7c. Sentinel (Tetragon) ---
+# `noded --init` leaves sentinel.enabled only on a dynamo node that asked for
+# the sentinel, and has already pointed plugins.docker.tetragon_addr in
+# config.json at the socket the container serves under /var/run/tetragon. The
+# container is recreated on every run so a re-install picks up the latest
+# image, as node-proxy is. It starts before dynamo, whose tetragon stream
+# retries until the socket is up either way.
+SENTINEL_MARKER="$INSTALL_ROOT/sentinel.enabled"
+SENTINEL_REPO="$SENTINEL_IMAGE"
+case "${SENTINEL_IMAGE##*/}" in *:*) SENTINEL_REPO="${SENTINEL_IMAGE%:*}" ;; esac
+
+# Prints the IDs of every container created from the sentinel image, named or
+# not: nodes set up by hand before install.sh managed the sentinel run an
+# unnamed one, and two Tetragons would fight over the same socket. Matched on
+# .Config.Image, which keeps the name given at creation even after
+# --pull=always moves the tag.
+sentinel_containers() {
+    ids=$(sudo docker ps -aq 2>/dev/null) || return 0
+    [ -n "$ids" ] || return 0
+    sudo docker inspect --format '{{.Id}} {{.Config.Image}}' $ids 2>/dev/null | while read -r id image; do
+        case "${image#docker.io/}" in
+            "$SENTINEL_REPO"|"$SENTINEL_REPO":*|"$SENTINEL_REPO"@*) echo "$id" ;;
+        esac
+    done
+}
+
+if [ "$ENABLE_DYNAMO" = true ] && [ -f "$SENTINEL_MARKER" ]; then
+    # A sentinel failure must not fail the install: dynamo runs without it,
+    # only logging that the tetragon stream is down.
+    if [ ! -e /sys/kernel/btf/vmlinux ]; then
+        echo "[WARN] Sentinel enabled, but the kernel has no BTF (/sys/kernel/btf/vmlinux); not starting it"
+    else
+        OLD_SENTINELS=$(sentinel_containers)
+        if [ -n "$OLD_SENTINELS" ]; then
+            sudo docker rm -f $OLD_SENTINELS >/dev/null 2>&1 || true
+        fi
+        echo "[*] Starting the sentinel container..."
+        if ! sudo docker run -d --name "$SENTINEL_CONTAINER" \
+            --pull=always \
+            --restart=always \
+            --pid=host \
+            --ipc=host \
+            --cgroupns=host \
+            --privileged \
+            -v /sys/kernel/btf/vmlinux:/var/lib/tetragon/btf \
+            -v /sys/kernel/debug:/sys/kernel/debug \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v /var/run/tetragon:/var/run/tetragon \
+            "$SENTINEL_IMAGE" >/dev/null; then
+            echo "[WARN] Could not start the sentinel container"
+        fi
+    fi
+elif command -v docker >/dev/null 2>&1; then
+    # Not enabled. A hand-started sentinel is left alone unless the caller
+    # turned it off explicitly; the one install.sh started is always removed.
+    if [ "$INSTALL_SENTINEL" = "false" ]; then
+        OLD_SENTINELS=$(sentinel_containers)
+    else
+        OLD_SENTINELS=$(sudo docker inspect --format '{{.Id}}' "$SENTINEL_CONTAINER" 2>/dev/null || true)
+    fi
+    if [ -n "$OLD_SENTINELS" ]; then
+        echo "[*] Sentinel not enabled for this node; removing its container"
+        sudo docker rm -f $OLD_SENTINELS >/dev/null 2>&1 || true
     fi
 fi
 
