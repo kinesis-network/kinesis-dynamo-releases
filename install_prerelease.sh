@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.10-alpha3
+# Kinesis Dynamo Bootstrap Script: v0.4.10-alpha4
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -403,7 +403,7 @@ fi
 # do not get one of them OOM-killed; the kernel keeps evicting file pages --
 # dockerd's, containerd's, dynamo's -- and the whole node freezes until a
 # reboot (dynamo #117). So app containers go in one slice capped at host RAM
-# minus a fixed reserve for the host itself: the agent, the container runtime,
+# minus a reserve for the host itself: the agent, the container runtime,
 # sshd, and the containers install.sh runs outside the slice (sentinel,
 # node-proxy). When the apps fill the slice, the kernel kills a container
 # inside it and the host stays up. Gateway containers are app containers here:
@@ -416,8 +416,12 @@ fi
 # cap is MemoryLimit=.
 #
 # The reserve has to cover everything outside the slice, kernel memory
-# included. A 3.7 GiB test node with the sentinel already used ~540 MiB there,
-# so 512 MiB left the host starved even with the slice under its cap.
+# included, and that grows with the host: ~540 MiB on a 3.7 GiB test node with
+# the sentinel (512 MiB left it starved), 4-6 GiB on a 177 GiB H100 node, where
+# ~2.4 GiB is NVIDIA driver memory (UVM, GDRCopy) that no counter or cgroup
+# accounts for and that moves with the GPU workload. So the reserve is
+# max(1 GiB, 5% of RAM): 1 GiB up to 20 GiB of RAM, ~8.9 GiB on that H100
+# node. APP_MEMORY_RESERVE_MB overrides it.
 #
 # The cap is computed from the RAM this host has now; a resized host gets a
 # new one on its next install/upgrade. Existing containers stay where they
@@ -428,8 +432,13 @@ fi
 # written here and removed when the slice is not installed.
 APP_SLICE="kinesis-apps.slice"
 APP_SLICE_FILE="/etc/systemd/system/$APP_SLICE"
-APP_MEMORY_RESERVE_MB=${APP_MEMORY_RESERVE_MB:-1024}
 HOST_MEM_MB=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 ))
+if [ -z "${APP_MEMORY_RESERVE_MB:-}" ]; then
+    APP_MEMORY_RESERVE_MB=$(( HOST_MEM_MB * 5 / 100 ))
+    if [ "$APP_MEMORY_RESERVE_MB" -lt 1024 ]; then
+        APP_MEMORY_RESERVE_MB=1024
+    fi
+fi
 APP_MEM_MAX_MB=$(( HOST_MEM_MB - APP_MEMORY_RESERVE_MB ))
 APP_SLICE_PARENT=""
 if [ "$APP_MEM_MAX_MB" -le 0 ]; then
