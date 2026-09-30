@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.10-beta1
+# Kinesis Dynamo Bootstrap Script: v0.4.10-alpha1
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -395,6 +395,66 @@ if [ "$HAS_NVIDIA_GPU" = true ]; then
     else
         echo "[*] Docker already runs the nvidia runtime; skipping restart"
     fi
+fi
+
+# --- 6.10. App memory slice ---
+# Nothing else bounds what app containers use together: each container's own
+# limit (if any) bounds only itself. On a host with no swap, apps that fill RAM
+# do not get one of them OOM-killed; the kernel keeps evicting file pages --
+# dockerd's, containerd's, dynamo's -- and the whole node freezes until a
+# reboot (dynamo #117). So app containers go in one slice capped at host RAM
+# minus a fixed reserve for the host itself: the agent, the container runtime,
+# sshd, and the containers install.sh runs outside the slice (sentinel,
+# node-proxy). When the apps fill the slice, the kernel kills a container
+# inside it and the host stays up. Gateway containers are app containers here:
+# dynamo creates them through the same path, so they share the cap.
+#
+# MemoryHigh sits a little below MemoryMax so the slice's page cache is
+# reclaimed, and heavy allocators slowed, before anything is killed. cgroup v1
+# has no soft limit, and its cap is MemoryLimit=.
+#
+# The cap is computed from the RAM this host has now; a resized host gets a
+# new one on its next install/upgrade. Existing containers stay where they
+# are until they are recreated: Docker cannot move a container to another
+# cgroup parent.
+#
+# dynamo learns the slice from plugins.docker.app_cgroup_parent in config.json,
+# written here and removed when the slice is not installed.
+APP_SLICE="kinesis-apps.slice"
+APP_SLICE_FILE="/etc/systemd/system/$APP_SLICE"
+APP_MEMORY_RESERVE_MB=${APP_MEMORY_RESERVE_MB:-512}
+HOST_MEM_MB=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 ))
+APP_MEM_MAX_MB=$(( HOST_MEM_MB - APP_MEMORY_RESERVE_MB ))
+APP_SLICE_PARENT=""
+if [ "$APP_MEM_MAX_MB" -le 0 ]; then
+    echo "[WARN] Host has ${HOST_MEM_MB} MiB RAM, not more than the ${APP_MEMORY_RESERVE_MB} MiB reserve; app containers stay uncapped"
+    if [ -f "$APP_SLICE_FILE" ]; then
+        sudo rm -f "$APP_SLICE_FILE"
+        sudo systemctl daemon-reload
+    fi
+else
+    if [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = "cgroup2fs" ]; then
+        APP_MEM_HIGH_MB=$(( APP_MEM_MAX_MB * 95 / 100 ))
+        APP_SLICE_LIMITS=$(printf 'MemoryHigh=%sM\nMemoryMax=%sM' "$APP_MEM_HIGH_MB" "$APP_MEM_MAX_MB")
+    else
+        APP_SLICE_LIMITS=$(printf 'MemoryLimit=%sM' "$APP_MEM_MAX_MB")
+    fi
+    APP_SLICE_DESIRED=$(printf '[Unit]\nDescription=Kinesis app containers\n\n[Slice]\nMemoryAccounting=yes\n%s\n' "$APP_SLICE_LIMITS")
+    if [ ! -f "$APP_SLICE_FILE" ] || [ "$(sudo cat "$APP_SLICE_FILE")" != "$APP_SLICE_DESIRED" ]; then
+        printf '%s\n' "$APP_SLICE_DESIRED" | sudo tee "$APP_SLICE_FILE" > /dev/null
+        # daemon-reload re-applies the limits to a slice that is already
+        # running, so an upgrade takes effect without touching its containers.
+        sudo systemctl daemon-reload
+    fi
+    sudo systemctl start "$APP_SLICE"
+    APP_SLICE_PARENT="$APP_SLICE"
+    echo "[*] App containers capped at ${APP_MEM_MAX_MB} MiB (host ${HOST_MEM_MB} MiB, reserve ${APP_MEMORY_RESERVE_MB} MiB)"
+fi
+if [ -f "$CONFIG_PATH" ]; then
+    sudo -u "$SERVICE_USER" jq --arg parent "$APP_SLICE_PARENT" \
+        'if $parent == "" then del(.plugins.docker.app_cgroup_parent)
+         else .plugins.docker.app_cgroup_parent = $parent end' \
+        "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && sudo -u "$SERVICE_USER" mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
 fi
 
 fi # ENABLE_DYNAMO: end of the container-runtime setup
