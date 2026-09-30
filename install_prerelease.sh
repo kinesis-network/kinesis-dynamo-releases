@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.10-alpha2
+# Kinesis Dynamo Bootstrap Script: v0.4.10-alpha3
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -409,9 +409,15 @@ fi
 # inside it and the host stays up. Gateway containers are app containers here:
 # dynamo creates them through the same path, so they share the cap.
 #
-# MemoryHigh sits a little below MemoryMax so the slice's page cache is
-# reclaimed, and heavy allocators slowed, before anything is killed. cgroup v1
-# has no soft limit, and its cap is MemoryLimit=.
+# Only a hard cap, no MemoryHigh: with no swap there is nothing to reclaim
+# from an app's anonymous memory, so above MemoryHigh the kernel only
+# throttles it. The app then creeps toward MemoryMax for hours without being
+# killed, while the host sits at its last free megabytes. On cgroup v1 the
+# cap is MemoryLimit=.
+#
+# The reserve has to cover everything outside the slice, kernel memory
+# included. A 3.7 GiB test node with the sentinel already used ~540 MiB there,
+# so 512 MiB left the host starved even with the slice under its cap.
 #
 # The cap is computed from the RAM this host has now; a resized host gets a
 # new one on its next install/upgrade. Existing containers stay where they
@@ -422,7 +428,7 @@ fi
 # written here and removed when the slice is not installed.
 APP_SLICE="kinesis-apps.slice"
 APP_SLICE_FILE="/etc/systemd/system/$APP_SLICE"
-APP_MEMORY_RESERVE_MB=${APP_MEMORY_RESERVE_MB:-512}
+APP_MEMORY_RESERVE_MB=${APP_MEMORY_RESERVE_MB:-1024}
 HOST_MEM_MB=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 ))
 APP_MEM_MAX_MB=$(( HOST_MEM_MB - APP_MEMORY_RESERVE_MB ))
 APP_SLICE_PARENT=""
@@ -434,10 +440,9 @@ if [ "$APP_MEM_MAX_MB" -le 0 ]; then
     fi
 else
     if [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = "cgroup2fs" ]; then
-        APP_MEM_HIGH_MB=$(( APP_MEM_MAX_MB * 95 / 100 ))
-        APP_SLICE_LIMITS=$(printf 'MemoryHigh=%sM\nMemoryMax=%sM' "$APP_MEM_HIGH_MB" "$APP_MEM_MAX_MB")
+        APP_SLICE_LIMITS="MemoryMax=${APP_MEM_MAX_MB}M"
     else
-        APP_SLICE_LIMITS=$(printf 'MemoryLimit=%sM' "$APP_MEM_MAX_MB")
+        APP_SLICE_LIMITS="MemoryLimit=${APP_MEM_MAX_MB}M"
     fi
     APP_SLICE_DESIRED=$(printf '[Unit]\nDescription=Kinesis app containers\n\n[Slice]\nMemoryAccounting=yes\n%s\n' "$APP_SLICE_LIMITS")
     if [ ! -f "$APP_SLICE_FILE" ] || [ "$(sudo cat "$APP_SLICE_FILE")" != "$APP_SLICE_DESIRED" ]; then
