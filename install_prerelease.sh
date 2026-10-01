@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.10-beta2
+# Kinesis Dynamo Bootstrap Script: v0.4.10-beta3
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -233,6 +233,27 @@ else
     fi
 fi
 
+# --- 6.6b. No inter-container traffic on the default bridge ---
+# Customer apps of different owners share docker0, and with icc on they can
+# reach each other's container IPs on any listening port (#121).  icc:false
+# drops docker0-to-docker0 traffic; published ports, host-to-container and
+# egress are unaffected, and so is Remote Reach: its gateways are reached
+# through published ports, and on a Remote Reach node the app and its gateway
+# sit on a per-app user-defined bridge, which this option does not touch.
+#
+# Written without a restart.  dockerd applies it only when it starts with no
+# running containers: with live-restore on, a restart over running containers
+# keeps the old bridge config.  So a node picks it up from a restart in
+# 6.7-6.9 when nothing runs yet, and otherwise at its next reboot.  6.9b
+# reports which case this run ended up in.
+if [ "$(sudo jq -r '.icc' "$DAEMON_JSON")" = "false" ]; then
+    echo "[*] Docker icc already disabled"
+else
+    echo "[*] Disabling inter-container communication on the default bridge"
+    sudo jq '. + {"icc": false}' "$DAEMON_JSON" | sudo tee "$DAEMON_JSON.tmp" > /dev/null
+    sudo mv "$DAEMON_JSON.tmp" "$DAEMON_JSON"
+fi
+
 # --- 6.7. Optional: Relocate Docker data-root ---
 # When DOCKER_DATA_ROOT is set, point Docker at it instead of the default
 # /var/lib/docker. Two pieces:
@@ -405,6 +426,16 @@ if [ "$HAS_NVIDIA_GPU" = true ]; then
     else
         echo "[*] Docker already runs the nvidia runtime; skipping restart"
     fi
+fi
+
+# --- 6.9b. Report whether icc:false is live ---
+BRIDGE_ICC=$(sudo docker network inspect bridge \
+    --format '{{index .Options "com.docker.network.bridge.enable_icc"}}' 2>/dev/null || true)
+if [ "$BRIDGE_ICC" = "false" ]; then
+    echo "[*] Default bridge runs with icc disabled"
+else
+    echo "[!] Default bridge still allows inter-container traffic; icc:false takes"
+    echo "    effect when dockerd next starts with no running containers (e.g. a reboot)"
 fi
 
 # --- 6.10. App memory slice ---
