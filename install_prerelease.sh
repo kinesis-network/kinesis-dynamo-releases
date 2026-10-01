@@ -188,8 +188,10 @@ else
 
 # --- 6.5. Container Runtime (Docker/NVIDIA) ---
 # Docker Setup
+DOCKER_FRESH_INSTALL=false
 if ! command -v docker >/dev/null 2>&1; then
     echo "[*] Installing Docker..."
+    DOCKER_FRESH_INSTALL=true
     sudo install -m 0755 -d /etc/apt/keyrings
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor --batch --yes -o /etc/apt/keyrings/docker.gpg
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | \
@@ -241,17 +243,21 @@ fi
 # through published ports, and on a Remote Reach node the app and its gateway
 # sit on a per-app user-defined bridge, which this option does not touch.
 #
-# Written without a restart.  dockerd applies it only when it starts with no
-# running containers: with live-restore on, a restart over running containers
-# keeps the old bridge config.  So a node picks it up from a restart in
-# 6.7-6.9 when nothing runs yet, and otherwise at its next reboot.  6.9b
-# reports which case this run ended up in.
+# dockerd applies it only when it starts with no running containers: with
+# live-restore on, a restart over running containers keeps the old bridge
+# config.  So docker is restarted only when this run installed it, which is
+# when nothing runs yet; an existing node picks it up at its next reboot.
+# 6.9b reports which case this run ended up in.
 if [ "$(sudo jq -r '.icc' "$DAEMON_JSON")" = "false" ]; then
     echo "[*] Docker icc already disabled"
 else
     echo "[*] Disabling inter-container communication on the default bridge"
     sudo jq '. + {"icc": false}' "$DAEMON_JSON" | sudo tee "$DAEMON_JSON.tmp" > /dev/null
     sudo mv "$DAEMON_JSON.tmp" "$DAEMON_JSON"
+    if [ "$DOCKER_FRESH_INSTALL" = true ]; then
+        echo "[*] Restarting the freshly installed docker to apply icc"
+        sudo systemctl restart docker
+    fi
 fi
 
 # --- 6.7. Optional: Relocate Docker data-root ---
