@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.9
+# Kinesis Dynamo Bootstrap Script: v0.4.10
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -14,6 +14,11 @@ SERVICE_USER=${SERVICE_USER:-"$USER"}
 CONFIG_PATH="$INSTALL_ROOT/config.json"
 # When true, `noded --init` is run with --test to generate test-specific config.
 FOR_TEST=${FOR_TEST:-false}
+# When true, noded and Stator skip verifying the managers' TLS certificates
+# (--insecure, like curl's). Only for test setups whose managers have no
+# trusted certificate, e.g. locally hosted managers. Not persisted: a re-run
+# without it, a self-upgrade included, verifies again.
+INSECURE=${INSECURE:-false}
 DYNAMO_SERVICES="dynamo.service dynamo-admin.service dynamo-gpu-enforcer.service dynamo-gpu-enforcer.path dynamo-firewall.service"
 STATOR_SERVICE="dynamo-stator.service"
 
@@ -154,7 +159,12 @@ if [ -f "$PROXY_DIR/proxy.env" ] && [ -f "$FIREWALL_MARKER" ]; then
     echo "[*] App proxy: removing stale firewall marker."
     sudo rm -f "$FIREWALL_MARKER"
 fi
-sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --lb-pool="${LB_POOL}" --public-ip="${PUBLIC_IP}" --enable-dynamo="${ENABLE_DYNAMO}" --install-sentinel="${INSTALL_SENTINEL}" $TEST_ARG
+INSECURE_ARG=""
+if [ "$INSECURE" = "true" ]; then
+    INSECURE_ARG="--insecure"
+    echo "[WARN] INSECURE=true: TLS certificates of the managers are not verified"
+fi
+sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --lb-pool="${LB_POOL}" --public-ip="${PUBLIC_IP}" --enable-dynamo="${ENABLE_DYNAMO}" --install-sentinel="${INSTALL_SENTINEL}" $TEST_ARG $INSECURE_ARG
 
 # The redeemed token's initial_state may have just disabled dynamo (recorded
 # in the marker by --init). Honor it in this same run: it decides whether the
@@ -178,8 +188,10 @@ else
 
 # --- 6.5. Container Runtime (Docker/NVIDIA) ---
 # Docker Setup
+DOCKER_FRESH_INSTALL=false
 if ! command -v docker >/dev/null 2>&1; then
     echo "[*] Installing Docker..."
+    DOCKER_FRESH_INSTALL=true
     sudo install -m 0755 -d /etc/apt/keyrings
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor --batch --yes -o /etc/apt/keyrings/docker.gpg
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | \
@@ -220,6 +232,31 @@ else
     sudo mv "$DAEMON_JSON.tmp" "$DAEMON_JSON"
     if ! sudo systemctl reload docker; then
         echo "[!] Could not reload docker; live-restore takes effect on its next restart"
+    fi
+fi
+
+# --- 6.6b. No inter-container traffic on the default bridge ---
+# Customer apps of different owners share docker0, and with icc on they can
+# reach each other's container IPs on any listening port (#121).  icc:false
+# drops docker0-to-docker0 traffic; published ports, host-to-container and
+# egress are unaffected, and so is Remote Reach: its gateways are reached
+# through published ports, and on a Remote Reach node the app and its gateway
+# sit on a per-app user-defined bridge, which this option does not touch.
+#
+# dockerd applies it only when it starts with no running containers: with
+# live-restore on, a restart over running containers keeps the old bridge
+# config.  So docker is restarted only when this run installed it, which is
+# when nothing runs yet; an existing node picks it up at its next reboot.
+# 6.9b reports which case this run ended up in.
+if [ "$(sudo jq -r '.icc' "$DAEMON_JSON")" = "false" ]; then
+    echo "[*] Docker icc already disabled"
+else
+    echo "[*] Disabling inter-container communication on the default bridge"
+    sudo jq '. + {"icc": false}' "$DAEMON_JSON" | sudo tee "$DAEMON_JSON.tmp" > /dev/null
+    sudo mv "$DAEMON_JSON.tmp" "$DAEMON_JSON"
+    if [ "$DOCKER_FRESH_INSTALL" = true ]; then
+        echo "[*] Restarting the freshly installed docker to apply icc"
+        sudo systemctl restart docker
     fi
 fi
 
@@ -397,6 +434,90 @@ if [ "$HAS_NVIDIA_GPU" = true ]; then
     fi
 fi
 
+# --- 6.9b. Report whether icc:false is live ---
+BRIDGE_ICC=$(sudo docker network inspect bridge \
+    --format '{{index .Options "com.docker.network.bridge.enable_icc"}}' 2>/dev/null || true)
+if [ "$BRIDGE_ICC" = "false" ]; then
+    echo "[*] Default bridge runs with icc disabled"
+else
+    echo "[!] Default bridge still allows inter-container traffic; icc:false takes"
+    echo "    effect when dockerd next starts with no running containers (e.g. a reboot)"
+fi
+
+# --- 6.10. App memory slice ---
+# Nothing else bounds what app containers use together: each container's own
+# limit (if any) bounds only itself. On a host with no swap, apps that fill RAM
+# do not get one of them OOM-killed; the kernel keeps evicting file pages --
+# dockerd's, containerd's, dynamo's -- and the whole node freezes until a
+# reboot (dynamo #117). So app containers go in one slice capped at host RAM
+# minus a reserve for the host itself: the agent, the container runtime,
+# sshd, and the containers install.sh runs outside the slice (sentinel,
+# node-proxy). When the apps fill the slice, the kernel kills a container
+# inside it and the host stays up. Gateway containers are app containers here:
+# dynamo creates them through the same path, so they share the cap.
+#
+# Only a hard cap, no MemoryHigh: with no swap there is nothing to reclaim
+# from an app's anonymous memory, so above MemoryHigh the kernel only
+# throttles it. The app then creeps toward MemoryMax for hours without being
+# killed, while the host sits at its last free megabytes. On cgroup v1 the
+# cap is MemoryLimit=.
+#
+# The reserve has to cover everything outside the slice, kernel memory
+# included, and that grows with the host: ~540 MiB on a 3.7 GiB test node with
+# the sentinel (512 MiB left it starved), 4-6 GiB on a 177 GiB H100 node, where
+# ~2.4 GiB is NVIDIA driver memory (UVM, GDRCopy) that no counter or cgroup
+# accounts for and that moves with the GPU workload. So the reserve is
+# max(1 GiB, 5% of RAM): 1 GiB up to 20 GiB of RAM, ~8.9 GiB on that H100
+# node. APP_MEMORY_RESERVE_MB overrides it.
+#
+# The cap is computed from the RAM this host has now; a resized host gets a
+# new one on its next install/upgrade. Existing containers stay where they
+# are until they are recreated: Docker cannot move a container to another
+# cgroup parent.
+#
+# dynamo learns the slice from plugins.docker.app_cgroup_parent in config.json,
+# written here and removed when the slice is not installed.
+APP_SLICE="kinesis-apps.slice"
+APP_SLICE_FILE="/etc/systemd/system/$APP_SLICE"
+HOST_MEM_MB=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 ))
+if [ -z "${APP_MEMORY_RESERVE_MB:-}" ]; then
+    APP_MEMORY_RESERVE_MB=$(( HOST_MEM_MB * 5 / 100 ))
+    if [ "$APP_MEMORY_RESERVE_MB" -lt 1024 ]; then
+        APP_MEMORY_RESERVE_MB=1024
+    fi
+fi
+APP_MEM_MAX_MB=$(( HOST_MEM_MB - APP_MEMORY_RESERVE_MB ))
+APP_SLICE_PARENT=""
+if [ "$APP_MEM_MAX_MB" -le 0 ]; then
+    echo "[WARN] Host has ${HOST_MEM_MB} MiB RAM, not more than the ${APP_MEMORY_RESERVE_MB} MiB reserve; app containers stay uncapped"
+    if [ -f "$APP_SLICE_FILE" ]; then
+        sudo rm -f "$APP_SLICE_FILE"
+        sudo systemctl daemon-reload
+    fi
+else
+    if [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = "cgroup2fs" ]; then
+        APP_SLICE_LIMITS="MemoryMax=${APP_MEM_MAX_MB}M"
+    else
+        APP_SLICE_LIMITS="MemoryLimit=${APP_MEM_MAX_MB}M"
+    fi
+    APP_SLICE_DESIRED=$(printf '[Unit]\nDescription=Kinesis app containers\n\n[Slice]\nMemoryAccounting=yes\n%s\n' "$APP_SLICE_LIMITS")
+    if [ ! -f "$APP_SLICE_FILE" ] || [ "$(sudo cat "$APP_SLICE_FILE")" != "$APP_SLICE_DESIRED" ]; then
+        printf '%s\n' "$APP_SLICE_DESIRED" | sudo tee "$APP_SLICE_FILE" > /dev/null
+        # daemon-reload re-applies the limits to a slice that is already
+        # running, so an upgrade takes effect without touching its containers.
+        sudo systemctl daemon-reload
+    fi
+    sudo systemctl start "$APP_SLICE"
+    APP_SLICE_PARENT="$APP_SLICE"
+    echo "[*] App containers capped at ${APP_MEM_MAX_MB} MiB (host ${HOST_MEM_MB} MiB, reserve ${APP_MEMORY_RESERVE_MB} MiB)"
+fi
+if [ -f "$CONFIG_PATH" ]; then
+    sudo -u "$SERVICE_USER" jq --arg parent "$APP_SLICE_PARENT" \
+        'if $parent == "" then del(.plugins.docker.app_cgroup_parent)
+         else .plugins.docker.app_cgroup_parent = $parent end' \
+        "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && sudo -u "$SERVICE_USER" mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+fi
+
 fi # ENABLE_DYNAMO: end of the container-runtime setup
 
 # Detect the cloud provider and patch its metadata into the config, but only
@@ -432,6 +553,12 @@ fi
 
 # --- 7. Systemd Integration ---
 echo "[*] Configuring systemd services..."
+# --insecure reaches the running agents through their ExecStart lines. The
+# unit files are fresh from the release archive on every run.
+if [ "$INSECURE" = "true" ]; then
+    sudo sed -i "s|noded -config=|noded --insecure -config=|" "$INSTALL_ROOT/dynamo.service"
+    sudo sed -i "s|stator -config=|stator --insecure -config=|" "$INSTALL_ROOT/$STATOR_SERVICE"
+fi
 for svc in $DYNAMO_SERVICES; do
     sudo sed -i "s|User=ubuntu|User=$SERVICE_USER|g" "$INSTALL_ROOT/$svc"
     sudo sed -i "s|/opt/dynamo/|$INSTALL_ROOT/|g" "$INSTALL_ROOT/$svc"
@@ -597,7 +724,7 @@ if [ -f "$PROXY_DIR/proxy.env" ]; then
 
     if [ "$DPA_HEALTHY" = true ]; then
         echo "[*] Post-registering app proxy (activating load balancer)..."
-        sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --postreg --config="$CONFIG_PATH"
+        sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --postreg --config="$CONFIG_PATH" $INSECURE_ARG
     else
         echo "[WARN] DataplaneAPI did not become healthy; skipping activation (LB stays pending)."
     fi
