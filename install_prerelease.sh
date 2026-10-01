@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.10-alpha4
+# Kinesis Dynamo Bootstrap Script: v0.4.10-alpha5
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -14,6 +14,11 @@ SERVICE_USER=${SERVICE_USER:-"$USER"}
 CONFIG_PATH="$INSTALL_ROOT/config.json"
 # When true, `noded --init` is run with --test to generate test-specific config.
 FOR_TEST=${FOR_TEST:-false}
+# When true, noded and Stator skip verifying the managers' TLS certificates
+# (--insecure, like curl's). Only for test setups whose managers have no
+# trusted certificate, e.g. locally hosted managers. Not persisted: a re-run
+# without it, a self-upgrade included, verifies again.
+INSECURE=${INSECURE:-false}
 DYNAMO_SERVICES="dynamo.service dynamo-admin.service dynamo-gpu-enforcer.service dynamo-gpu-enforcer.path dynamo-firewall.service"
 STATOR_SERVICE="dynamo-stator.service"
 
@@ -154,7 +159,12 @@ if [ -f "$PROXY_DIR/proxy.env" ] && [ -f "$FIREWALL_MARKER" ]; then
     echo "[*] App proxy: removing stale firewall marker."
     sudo rm -f "$FIREWALL_MARKER"
 fi
-sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --lb-pool="${LB_POOL}" --public-ip="${PUBLIC_IP}" --enable-dynamo="${ENABLE_DYNAMO}" --install-sentinel="${INSTALL_SENTINEL}" $TEST_ARG
+INSECURE_ARG=""
+if [ "$INSECURE" = "true" ]; then
+    INSECURE_ARG="--insecure"
+    echo "[WARN] INSECURE=true: TLS certificates of the managers are not verified"
+fi
+sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --lb-pool="${LB_POOL}" --public-ip="${PUBLIC_IP}" --enable-dynamo="${ENABLE_DYNAMO}" --install-sentinel="${INSTALL_SENTINEL}" $TEST_ARG $INSECURE_ARG
 
 # The redeemed token's initial_state may have just disabled dynamo (recorded
 # in the marker by --init). Honor it in this same run: it decides whether the
@@ -506,6 +516,12 @@ fi
 
 # --- 7. Systemd Integration ---
 echo "[*] Configuring systemd services..."
+# --insecure reaches the running agents through their ExecStart lines. The
+# unit files are fresh from the release archive on every run.
+if [ "$INSECURE" = "true" ]; then
+    sudo sed -i "s|noded -config=|noded --insecure -config=|" "$INSTALL_ROOT/dynamo.service"
+    sudo sed -i "s|stator -config=|stator --insecure -config=|" "$INSTALL_ROOT/$STATOR_SERVICE"
+fi
 for svc in $DYNAMO_SERVICES; do
     sudo sed -i "s|User=ubuntu|User=$SERVICE_USER|g" "$INSTALL_ROOT/$svc"
     sudo sed -i "s|/opt/dynamo/|$INSTALL_ROOT/|g" "$INSTALL_ROOT/$svc"
@@ -671,7 +687,7 @@ if [ -f "$PROXY_DIR/proxy.env" ]; then
 
     if [ "$DPA_HEALTHY" = true ]; then
         echo "[*] Post-registering app proxy (activating load balancer)..."
-        sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --postreg --config="$CONFIG_PATH"
+        sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --postreg --config="$CONFIG_PATH" $INSECURE_ARG
     else
         echo "[WARN] DataplaneAPI did not become healthy; skipping activation (LB stays pending)."
     fi
