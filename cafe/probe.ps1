@@ -12,6 +12,12 @@
 # Files:
 #   C:\Kinesis\hook.log     one block per firing, appended
 #   C:\Kinesis\machine.txt  full inventory, rewritten on every firing
+#   C:\Kinesis\boots.log    one line per firing with the boot time. Lines from before a reboot
+#                           vanishing after it means the disk is frozen or diskless.
+#
+# The probe stamps "alive" lines into hook.log as it goes - after the event block, after the
+# inventory, and at 30 seconds - each with its real elapsed time, so the log shows how long
+# CafePlus let the hook live. The person testing notes whether the customer's unlock waited.
 
 param([string]$Event = 'unknown')
 $ErrorActionPreference = 'Continue'
@@ -71,6 +77,9 @@ $block = @(
     ""
 )
 ($block -join "`r`n") | Out-File -FilePath $log -Append -Encoding utf8
+function Mark([string]$stage) { "alive $stage +$([int]((Get-Date) - $t0).TotalSeconds)s event=$Event pid=$PID $((Get-Date).ToString('HH:mm:ss.fff'))" | Out-File -FilePath $log -Append -Encoding utf8 }
+Mark 'event-logged'
+"$($t0.ToString('yyyy-MM-dd HH:mm:ss')) event=$Event last_boot=$($os.LastBootUpTime) uptime_min=$upMin" | Out-File -FilePath (Join-Path $dir 'boots.log') -Append -Encoding utf8
 
 # ---------------------------------------------------------------- 2. the machine inventory
 $cs   = Try-Get { Get-CimInstance Win32_ComputerSystem }
@@ -87,6 +96,14 @@ $tz   = Try-Get { (Get-TimeZone).Id }
 $page = Try-Get { Get-CimInstance Win32_PageFileUsage }
 $bootcfg = Try-Get { Get-CimInstance Win32_BootConfiguration }
 $svcDiskless = Try-Get { Get-Service | Where-Object { $_.Name -match 'iscsi|ccboot|diskless|netboot|ibootnet|pxe|cafe|akin' -or $_.DisplayName -match 'iscsi|ccboot|diskless|netboot|cafe|akin' } | ForEach-Object { "$($_.Name)=$($_.Status)" } }
+$freezeSoftware = Try-Get {
+    $pattern = 'dfserv|deepfr|faronics|shdserv|shadow ?defender|uwf|rollback|reboot ?restore|returnil|toolwiz|centurion|smartshield|drvfreeze|eyebeam|wondershare|rxsrv|horizon'
+    $svc = Get-Service | Where-Object { $_.Name -match $pattern -or $_.DisplayName -match $pattern } | ForEach-Object { "service:$($_.Name)=$($_.Status)" }
+    $drv = Get-CimInstance Win32_SystemDriver | Where-Object { $_.Name -match $pattern -or $_.DisplayName -match $pattern } | ForEach-Object { "driver:$($_.Name)=$($_.State)" }
+    @($svc) + @($drv)
+}
+$uwf = Try-Get { if (Get-Command uwfmgr.exe -ErrorAction SilentlyContinue) { (uwfmgr.exe get-config 2>&1 | Out-String).Trim() -replace "`r?`n", ' / ' } else { 'uwfmgr not present' } }
+$bootsSoFar = Try-Get { (Get-Content (Join-Path $dir 'boots.log') -ErrorAction Stop | Measure-Object -Line).Lines }
 $procs = Try-Get { (Get-Process | Select-Object -ExpandProperty Name -Unique | Sort-Object) -join ', ' }
 $uninst = Try-Get {
     $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
@@ -145,6 +162,9 @@ $inventory = @(
     "disks=$(Join-Multi ($disks | ForEach-Object { "$($_.Model) interface=$($_.InterfaceType) size_gb=$([int]($_.Size/1GB)) media=$($_.MediaType) serial=$($_.SerialNumber) pnp=$($_.PNPDeviceID)" }))",
     "volumes=$(Join-Multi ($vols | ForEach-Object { "$($_.DeviceID) fs=$($_.FileSystem) size_gb=$([int]($_.Size/1GB)) free_gb=$([int]($_.FreeSpace/1GB)) label=$($_.VolumeName)" }))",
     "diskless_or_cafe_services=$(Join-Multi $svcDiskless)",
+    "freeze_software=$(Join-Multi $freezeSoftware)",
+    "uwf=$uwf",
+    "boots_log_lines=$bootsSoFar (compare across a reboot: fewer lines than before means writes do not survive)",
     "",
     "[network]",
     "$(Join-Multi ($nics | ForEach-Object { "$($_.Description) mac=$($_.MACAddress) ip=$($_.IPAddress -join ',') gw=$($_.DefaultIPGateway -join ',') dhcp=$($_.DHCPEnabled) dns=$($_.DNSServerSearchOrder -join ',')" }))",
@@ -171,3 +191,10 @@ $inventory = @(
     ""
 )
 ($inventory -join "`r`n") | Out-File -FilePath $inv -Encoding utf8
+
+# ---------------------------------------------------------------- 3. does the hook get to live
+# Last, so the inventory above is written however early CafePlus ends the hook.
+Mark 'inventory-written'
+$wait = $t0.AddSeconds(30) - (Get-Date)
+if ($wait.TotalMilliseconds -gt 0) { Start-Sleep -Milliseconds ([int]$wait.TotalMilliseconds) }
+Mark 'held-30s'

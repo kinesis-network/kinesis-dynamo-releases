@@ -31,6 +31,18 @@ up to five minutes.
   NICs with MACs, WSL and Hyper-V feature state, secure boot, TPM, local users and
   administrators, sessions, relevant installed software, running process names.
 
+## What to note by hand while testing
+
+- **Did the customer's unlock wait?** The probe deliberately stays alive for 30 seconds. Note
+  whether CafePlus held the unlock (or the lock screen) until it finished. `hook.log` shows
+  `alive event-logged`, `alive inventory-written` and `alive held-30s` lines with elapsed
+  seconds; the last one present says how long CafePlus let the hook live.
+- **Run it on at least two PCs.** Per-PC identity will be built from hardware IDs, and only a
+  comparison across machines shows which ones are actually unique. A cloned image gives every
+  PC the same `machine_guid`, and some boards ship the same placeholder `smbios_uuid`.
+- **Reboot one PC once and fire a hook again.** If `boots.log` lost its earlier lines, the
+  disk is frozen or diskless. `freeze_software` in `machine.txt` names what does it.
+
 ## Fallbacks, if `hook.log` does not appear on the TEST PC
 
 1. Look for it on the REGISTER PC. Present there means the box runs on the server.
