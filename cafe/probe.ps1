@@ -111,7 +111,10 @@ $uninst = Try-Get {
 }
 $wslFeature = Try-Get { (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Lxss' -ErrorAction Stop).DefaultDistribution }
 $optFeatures = Try-Get { dism /online /english /get-features /format:table 2>$null | Select-String 'Microsoft-Windows-Subsystem-Linux|VirtualMachinePlatform|Microsoft-Hyper-V' | ForEach-Object { $_.Line.Trim() } }
-$wslStatus = Try-Get { if (Get-Command wsl.exe -ErrorAction SilentlyContinue) { (wsl.exe --status 2>&1 | Out-String).Trim() } else { 'wsl.exe not found' } }
+# CafePlus starts the probe from a 32-bit shell, where System32 is redirected to SysWOW64 and wsl.exe
+# is not there, so "not found" said nothing. Sysnative is the real System32 from a 32-bit process.
+$wslExe = if ([Environment]::Is64BitProcess) { "$env:windir\System32\wsl.exe" } else { "$env:windir\Sysnative\wsl.exe" }
+$wslStatus = Try-Get { if (Test-Path $wslExe) { ((& $wslExe --status 2>&1 | Out-String) -replace "`0", '').Trim() -replace "`r?`n", ' / ' } else { "wsl.exe not present ($wslExe)" } }
 $secureBoot = Try-Get { Confirm-SecureBootUEFI }
 $tpm = Try-Get { (Get-CimInstance -Namespace root/cimv2/security/microsofttpm -ClassName Win32_Tpm).SpecVersion }
 $powerPlan = Try-Get { (Get-CimInstance -Namespace root/cimv2/power -ClassName Win32_PowerPlan -Filter "IsActive=True").ElementName }
@@ -125,8 +128,16 @@ $vtFirmware = Try-Get { Join-Multi ($cpu | ForEach-Object { $_.VirtualizationFir
 $kinesisDir = Try-Get { (Get-ChildItem 'C:\Kinesis' -ErrorAction Stop | ForEach-Object { "$($_.Name) $($_.LastWriteTime.ToString('HH:mm:ss'))" }) -join ', ' }
 $t1 = Get-Date
 
+# The one line nobody may miss: WSL2, and so Spark, cannot run on a PC whose BIOS has CPU
+# virtualization switched off, and at the first venue two PCs of the same chain differed.
+# A running hypervisor proves it is on even where the firmware flag reads False.
+$virtOn = ($cpu | Where-Object { $_.VirtualizationFirmwareEnabled -eq $true }) -or ($hvPresent -eq $true)
+$virtVerdict = if ($virtOn) { 'ON' } else { 'OFF - enable SVM (AMD) or VT-x (Intel) in this PC BIOS before installing Spark' }
+
 $inventory = @(
     "Kinesis cafe probe inventory. Written $($t1.ToString('yyyy-MM-dd HH:mm:ss')) during event=$Event. Probe runtime $([int]($t1 - $t0).TotalMilliseconds) ms.",
+    "",
+    "VIRTUALIZATION: $virtVerdict",
     "",
     "[identity]",
     "computer_name=$env:COMPUTERNAME domain_or_workgroup=$($cs.Domain) part_of_domain=$($cs.PartOfDomain)",
@@ -195,6 +206,80 @@ $inventory = @(
 # ---------------------------------------------------------------- 3. does the hook get to live
 # Last, so the inventory above is written however early CafePlus ends the hook.
 Mark 'inventory-written'
-$wait = $t0.AddSeconds(30) - (Get-Date)
-if ($wait.TotalMilliseconds -gt 0) { Start-Sleep -Milliseconds ([int]$wait.TotalMilliseconds) }
+
+# ---------------------------------------------------------------- 4. where CafePlus keeps its state
+# No hook fires at boot, and a rented PC stays rented through a restart, so Spark has to read
+# "rented or not" from CafePlus itself. Captured 5 and 25 seconds after each hook - once while the
+# transition may still be settling, once after - so comparing a rent with an end of session shows
+# which registry value, file or window changes with it. Values are cut to 120 characters.
+$statePath = Join-Path $dir 'cafeplus-state.txt'
+try {
+    Add-Type -TypeDefinition @'
+using System; using System.Text; using System.Collections.Generic; using System.Runtime.InteropServices;
+public static class KinesisWindows {
+    delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc f, IntPtr l);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out Rect r);
+    [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int i);
+    public struct Rect { public int L, T, R, B; }
+    public static List<string> Visible(uint[] pids) {
+        var found = new List<string>();
+        EnumWindows(delegate(IntPtr h, IntPtr l) {
+            uint pid; GetWindowThreadProcessId(h, out pid);
+            if (Array.IndexOf(pids, pid) >= 0 && IsWindowVisible(h)) {
+                var title = new StringBuilder(256); GetWindowText(h, title, 256);
+                Rect r; GetWindowRect(h, out r);
+                bool topmost = (GetWindowLong(h, -20) & 0x8) != 0;
+                found.Add(string.Format("window pid={0} topmost={1} rect={2},{3} {4}x{5} title={6}", pid, topmost, r.L, r.T, r.R - r.L, r.B - r.T, title));
+            }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+}
+'@
+} catch {}
+
+function Capture-CafePlus([string]$stage) {
+    $lines = @("=== $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')) event=$Event stage=$stage")
+    foreach ($root in 'HKLM:\SOFTWARE\WOW6432Node\AKINSOFT', 'HKLM:\SOFTWARE\AKINSOFT', 'HKCU:\Software\AKINSOFT') {
+        if (-not (Test-Path $root)) { continue }
+        $keys = @(Get-Item $root) + @(Get-ChildItem $root -Recurse -ErrorAction SilentlyContinue)
+        foreach ($k in $keys) {
+            foreach ($n in $k.GetValueNames()) {
+                $v = "$($k.GetValue($n))"
+                if ($v.Length -gt 120) { $v = $v.Substring(0, 120) + '...' }
+                $lines += "reg $($k.Name)\$n=$v"
+            }
+        }
+    }
+    $cpDir = 'C:\Program Files (x86)\AKINSOFT\CafePlusClient12'
+    $recent = (Get-Date).AddMinutes(-3)
+    Get-ChildItem $cpDir -Recurse -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 40 | ForEach-Object {
+        $lines += "file $($_.FullName.Substring($cpDir.Length)) size=$($_.Length) written=$($_.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss.fff'))"
+        if ($_.LastWriteTime -gt $recent -and $_.Length -lt 4096 -and $_.Extension -match '^\.(ini|cfg|txt|xml|json|dat)$') {
+            Get-Content $_.FullName -TotalCount 30 -ErrorAction SilentlyContinue | ForEach-Object { $lines += "  | $_" }
+        }
+    }
+    try {
+        $pids = [uint32[]]@(Get-Process cplusc -ErrorAction Stop | ForEach-Object { $_.Id })
+        $lines += [KinesisWindows]::Visible($pids)
+    } catch { $lines += "windows: ERR $($_.Exception.Message)" }
+    $lines += ''
+    ($lines -join "`r`n") | Out-File -FilePath $statePath -Append -Encoding utf8
+}
+
+function Wait-Until([int]$seconds) {
+    $wait = $t0.AddSeconds($seconds) - (Get-Date)
+    if ($wait.TotalMilliseconds -gt 0) { Start-Sleep -Milliseconds ([int]$wait.TotalMilliseconds) }
+}
+
+Wait-Until 5
+try { Capture-CafePlus 'after-5s' } catch {}
+Wait-Until 25
+try { Capture-CafePlus 'after-25s' } catch {}
+Wait-Until 30
 Mark 'held-30s'
