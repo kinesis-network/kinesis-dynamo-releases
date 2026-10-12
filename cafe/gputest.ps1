@@ -53,6 +53,10 @@ mount --bind `$V /usr/lib/wsl/lib
 mount --bind "`$DRV" `$D
 echo "--- after bridging (linked):"; LD_LIBRARY_PATH=/usr/lib/wsl/lib /usr/lib/wsl/lib/nvidia-smi -L 2>&1 | head -3
 echo "--- driver folder sample:"; ls `$D | head -5
+echo "--- CUDA (what jobs use; NVML can refuse while CUDA works):"
+LD_LIBRARY_PATH=/usr/lib/wsl/lib python3 -c "import ctypes;c=ctypes.CDLL('libcuda.so.1');r=c.cuInit(0);n=ctypes.c_int(0);c.cuDeviceGetCount(ctypes.byref(n));print('cuInit',r,'devices',n.value)" 2>&1 | tail -2
+echo "--- kernel log (dxg = WSL's GPU driver):"
+dmesg 2>/dev/null | grep -i -E 'dxg|gpu|nvidia' | tail -20
 "@
 $path = 'C:\Kinesis\gputest.sh'
 New-Item -ItemType Directory -Force C:\Kinesis | Out-Null
