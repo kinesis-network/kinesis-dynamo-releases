@@ -80,9 +80,11 @@ if ($maps.Count -eq 0) {
     'UDP: BLOCKED - no STUN server answered on UDP 19302 or 3478. WireGuard between nodes will not work from this network.'
 } else {
     'UDP: outbound high-port UDP works.'
-    $publicIp = ($maps[0] -split ':')[0]
-    "public_ipv4=$publicIp"
-    if (($maps | ForEach-Object { ($_ -split ':')[1] } | Sort-Object -Unique).Count -eq 1) {
+    $ips = $maps | ForEach-Object { ($_ -split ':')[0] } | Sort-Object -Unique
+    "public_ipv4=$($ips -join ',')"
+    if ($ips.Count -gt 1) {
+        "LINES: $($ips.Count) public IPs - traffic is balanced across several internet lines per destination. A node has no single public endpoint; WireGuard between nodes needs a relay, or the PCs pinned to one line with a forwarded port."
+    } elseif (($maps | ForEach-Object { ($_ -split ':')[1] } | Sort-Object -Unique).Count -eq 1) {
         $samePort = ($maps[0] -split ':')[1] -eq "$localPort"
         "NAT: same outside port for every destination (endpoint-independent mapping)$(if ($samePort) { ', and it kept the local port' }). WireGuard can work with keepalives."
     } else {
