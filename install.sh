@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.25
+# Kinesis Dynamo Bootstrap Script: v0.4.26
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -84,6 +84,17 @@ echo "DOCKER_DATA_ROOT=${DOCKER_DATA_ROOT:-<default>}"
 echo "CONTAINERD_ROOT=${CONTAINERD_ROOT:-<default>}"
 echo "ENABLE_DYNAMO=$ENABLE_DYNAMO"
 echo "INSTALL_SENTINEL=${INSTALL_SENTINEL:-<token>}"
+
+# Rewrites config.json through jq; the arguments are jq's, without the file.
+# config.json stays 0600 and owned by the service user, as `noded --init`
+# writes it: the temp file is created that way before jq writes into it, and
+# the redirect keeps the mode and owner of a file that already exists.
+patch_config() {
+    sudo -u "$SERVICE_USER" install -m 600 /dev/null "$CONFIG_PATH.tmp"
+    if sudo -u "$SERVICE_USER" jq "$@" "$CONFIG_PATH" > "$CONFIG_PATH.tmp"; then
+        sudo -u "$SERVICE_USER" mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+    fi
+}
 
 # --- 3. Install Core Dependencies ---
 echo "[*] Installing system dependencies..."
@@ -512,10 +523,9 @@ else
     echo "[*] App containers capped at ${APP_MEM_MAX_MB} MiB (host ${HOST_MEM_MB} MiB, reserve ${APP_MEMORY_RESERVE_MB} MiB)"
 fi
 if [ -f "$CONFIG_PATH" ]; then
-    sudo -u "$SERVICE_USER" jq --arg parent "$APP_SLICE_PARENT" \
+    patch_config --arg parent "$APP_SLICE_PARENT" \
         'if $parent == "" then del(.plugins.docker.app_cgroup_parent)
-         else .plugins.docker.app_cgroup_parent = $parent end' \
-        "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && sudo -u "$SERVICE_USER" mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+         else .plugins.docker.app_cgroup_parent = $parent end'
 fi
 
 fi # ENABLE_DYNAMO: end of the container-runtime setup
@@ -544,10 +554,9 @@ if [ -z "$CURRENT_CSP" ]; then
 
     if [ -f "$CONFIG_PATH" ]; then
         echo "[*] Patching configuration..."
-        sudo -u "$SERVICE_USER" jq \
+        patch_config \
             --arg csp "$CSP" --arg reg "$REGION" --arg zone "$ZONE" \
-            '. + {csp: $csp, csp_region: $reg, csp_zone: $zone}' \
-            "$CONFIG_PATH" > "$CONFIG_PATH.tmp" && sudo -u "$SERVICE_USER" mv "$CONFIG_PATH.tmp" "$CONFIG_PATH"
+            '. + {csp: $csp, csp_region: $reg, csp_zone: $zone}'
     fi
 fi
 
