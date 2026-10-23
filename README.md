@@ -13,32 +13,35 @@ This repo is used for hosting public releases of Kinesis Dynamo.  Kinesis Dynamo
 We provide a script to install required packages including Docker engine, download binaries,
 and configure it to run as systemd services.
 
-IMPORTANT: Before you continue, I encourage you to read the script; never trust someone
-telling you to run random commands.
+Only Debian-based Linux distributions are supported.
 
-1. Download the bootstrap script
+IMPORTANT: Read [install.sh](install.sh) before you run it. Never run a command you haven't checked.
 
-   ```shell
-   curl -L -s \
-     -H "Accept: application/octet-stream" \
-     -o install_dynamo.sh \
-     $(curl -L -s https://api.github.com/repos/kinesis-network/kinesis-dynamo-releases/releases/latest \
-       | jq -r '.assets[] | select(.name | test(".sh$")) | .url'); chmod 755 install_dynamo.sh
-   ```
+1. Run the install command
 
-2. Run the script
+   Open **Add Servers** in the [Kinesis portal](https://portal.kinesis.network/signin) to get a
+   command with your provision token, then run it on the server:
 
    ```shell
-   PUBLIC_IP=global ./install_dynamo.sh
+   curl -sSL https://raw.githubusercontent.com/kinesis-network/kinesis-dynamo-releases/refs/heads/main/install.sh | env PROVISION_TOKEN=<your token> sh
    ```
 
-   where you can specify the following optional parameters.
+   Keep the token secret: anyone who has it can register servers to your account.
 
+   You can set these optional parameters in the same `env` list:
+
+   - `RELEASE_VERSION`: the release tag to install (default: `latest`, the latest stable release)
    - `SERVICE_USER`: a service user to run dynamo processes (default: current user)
-   - `PUBLIC_IP`: specify "global" to set up a global node (default: "")
    - `INSTALL_ROOT`: the root installation directory (default: /opt/dynamo)
 
-3. Verify installation
+   To install a prerelease, use [install_prerelease.sh](install_prerelease.sh) and pin a tag from
+   [Releases](https://github.com/kinesis-network/kinesis-dynamo-releases/releases):
+
+   ```shell
+   curl -sSL https://raw.githubusercontent.com/kinesis-network/kinesis-dynamo-releases/refs/heads/main/install_prerelease.sh | env PROVISION_TOKEN=<your token> RELEASE_VERSION=v0.4.28-beta2 sh
+   ```
+
+2. Verify installation
 
    Once installation is done, binaries and config files are placed in the root directory, and two services have started (dynamo and dynamo-admin).
    You can run `sudo systemctl status dynamo` and `sudo systemctl status dynamo-admin` to check the service status.
