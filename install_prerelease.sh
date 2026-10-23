@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.28-beta2
+# Kinesis Dynamo Bootstrap Script: v0.4.28-beta3
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -103,6 +103,37 @@ sudo apt-get install -y jq curl gnupg lsb-release libarchive-tools pciutils
 
 sudo usermod -aG systemd-journal "$SERVICE_USER"
 
+# --- 4. Download Release ---
+# The release is fetched from github.com, not api.github.com: the REST API
+# allows 60 unauthenticated requests per hour per public IP, which nodes
+# behind a shared IP (CGNAT, office NAT) run out of. It is fetched before any
+# service is stopped, so a bad tag or a failed download leaves the node as it
+# was.
+echo "[*] Downloading Kinesis Dynamo (${RELEASE_VERSION})..."
+REPO="kinesis-network/kinesis-dynamo-releases"
+if [ "$RELEASE_VERSION" = "latest" ]; then
+    # /releases/latest redirects to /releases/tag/<latest stable tag>.
+    LATEST_URL=$(curl -sS -o /dev/null -w '%{redirect_url}' "https://github.com/$REPO/releases/latest") || LATEST_URL=""
+    case "$LATEST_URL" in
+        */releases/tag/?*) RELEASE_TAG="${LATEST_URL##*/}" ;;
+        *)
+            echo "Failed to resolve the latest release of $REPO (redirect: ${LATEST_URL:-<none>})"
+            exit 1
+            ;;
+    esac
+    echo "[*] Latest release: $RELEASE_TAG"
+else
+    RELEASE_TAG="$RELEASE_VERSION"
+fi
+
+ASSET_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/dynamo-$RELEASE_TAG-$OS_ARCH.zip"
+echo "[*] Fetching asset: $ASSET_URL"
+if ! curl -fsSL --retry 3 -o /tmp/dynamo.zip "$ASSET_URL"; then
+    rm -f /tmp/dynamo.zip
+    echo "Failed to download the $OS_ARCH asset of release $RELEASE_TAG. Check that the release exists: https://github.com/$REPO/releases/tag/$RELEASE_TAG"
+    exit 1
+fi
+
 # --- 4.5 Stop existing services if they exist ---
 echo "[*] Checking for existing services..."
 for svc in $DYNAMO_SERVICES $STATOR_SERVICE; do
@@ -112,25 +143,8 @@ for svc in $DYNAMO_SERVICES $STATOR_SERVICE; do
     fi
 done
 
-# --- 5. Download & Extract Release ---
-echo "[*] Downloading Kinesis Dynamo (${RELEASE_VERSION})..."
-REPO="kinesis-network/kinesis-dynamo-releases"
-if [ "$RELEASE_VERSION" = "latest" ]; then
-    REL_DATA=$(curl -sL "https://api.github.com/repos/$REPO/releases/latest")
-else
-    REL_DATA=$(curl -sL "https://api.github.com/repos/$REPO/releases/tags/$RELEASE_VERSION")
-fi
-
-# Extract the specific zip URL for the detected architecture
-ASSET_URL=$(echo "$REL_DATA" | jq -r --arg arch "$OS_ARCH" '.assets[] | select(.name | test("dynamo-.*-" + $arch + "\\.zip$")) | .url')
-if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
-    echo "Failed to find a .zip asset for $OS_ARCH in release $RELEASE_VERSION"
-    exit 1
-fi
-echo "[*] Found asset: $ASSET_URL"
-
+# --- 5. Extract Release ---
 sudo mkdir -p "$INSTALL_ROOT/mounts"
-curl -sL -H "Accept: application/octet-stream" -o /tmp/dynamo.zip "$ASSET_URL"
 sudo bsdtar -xvf /tmp/dynamo.zip -C "$INSTALL_ROOT"
 sudo chown -R "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_ROOT"
 sudo rm /tmp/dynamo.zip
