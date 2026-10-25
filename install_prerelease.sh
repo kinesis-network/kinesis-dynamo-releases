@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.28-beta7
+# Kinesis Dynamo Bootstrap Script: v0.4.28-beta8
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -560,35 +560,8 @@ fi
 
 fi # ENABLE_DYNAMO: end of the container-runtime setup
 
-# Detect the cloud provider and patch its metadata into the config, but only
-# when it is not recorded yet, so re-running install.sh on an existing node
-# respects its current values.
-CURRENT_CSP=""
-[ -f "$CONFIG_PATH" ] && CURRENT_CSP=$(sudo -u "$SERVICE_USER" jq -r '.csp // ""' "$CONFIG_PATH")
-if [ -z "$CURRENT_CSP" ]; then
-    echo "[*] Detecting Cloud Provider..."
-    CSP="manual"; REGION="unknown"; ZONE="unknown"
-    # Define common curl timeout settings
-    # --connect-timeout: max time to wait for connection
-    # -m, --max-time: max time for the whole operation
-    TIMEOUT_FLAGS="--connect-timeout 2 --max-time 3"
-    # AWS IMDSv2
-    if TOKEN=$(curl $TIMEOUT_FLAGS -fsS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null); then
-        ZONE=$(curl $TIMEOUT_FLAGS -fsS -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/placement/availability-zone")
-        REGION="${ZONE%[a-z]}"; CSP="aws"
-    # Azure
-    elif REGION=$(curl $TIMEOUT_FLAGS -fsS -H "Metadata: true" "http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text" 2>/dev/null); then
-        CSP="azure"; ZONE=$(curl $TIMEOUT_FLAGS -fsS -H "Metadata: true" "http://169.254.169.254/metadata/instance/compute/zone?api-version=2021-02-01&format=text" 2>/dev/null || echo "1")
-    fi
-    echo "[*] Provider: $CSP ($REGION / $ZONE)"
-
-    if [ -f "$CONFIG_PATH" ]; then
-        echo "[*] Patching configuration..."
-        patch_config \
-            --arg csp "$CSP" --arg reg "$REGION" --arg zone "$ZONE" \
-            '. + {csp: $csp, csp_region: $reg, csp_zone: $zone}'
-    fi
-fi
+# The cloud provider (csp, csp_region, csp_zone) is detected by `noded --init`
+# above, from the instance metadata service, when the config has none yet.
 
 if [ -n "$GRPC_BIND" ] && [ -f "$CONFIG_PATH" ]; then
     echo "[*] Binding noded's gRPC server to $GRPC_BIND"
