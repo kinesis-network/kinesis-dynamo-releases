@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.28-beta5
+# Kinesis Dynamo Bootstrap Script: v0.4.28-beta6
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -19,6 +19,18 @@ FOR_TEST=${FOR_TEST:-false}
 # trusted certificate, e.g. locally hosted managers. Not persisted: a re-run
 # without it, a self-upgrade included, verifies again.
 INSECURE=${INSECURE:-false}
+# The address noded's gRPC server binds (config.json grpc_bind), e.g.
+# tcp://0.0.0.0:50002 for a WSL2 distro that Spark reaches from Windows.
+# Empty keeps the node's current value, which `noded --init` keeps too; a
+# node that never had one binds noded's default unix socket.
+GRPC_BIND=${GRPC_BIND:-""}
+# OOBE=true installs the node out-of-box, for an image that is cloned (Spark
+# venue PCs): `noded --init --oobe` writes the config a provision would
+# without an identity or a call to the Node Manager, so no token is used, and
+# the agent units stay disabled. Each clone then runs `noded --init=<token>`
+# and `noded --enable-units`. Takes no PROVISION_TOKEN (an @<host>:<port>
+# manager list is fine). Not persisted: a later run installs a normal node.
+OOBE=${OOBE:-false}
 DYNAMO_SERVICES="dynamo.service dynamo-admin.service dynamo-gpu-enforcer.service dynamo-gpu-enforcer.path dynamo-firewall.service"
 STATOR_SERVICE="dynamo-stator.service"
 
@@ -84,6 +96,8 @@ echo "DOCKER_DATA_ROOT=${DOCKER_DATA_ROOT:-<default>}"
 echo "CONTAINERD_ROOT=${CONTAINERD_ROOT:-<default>}"
 echo "ENABLE_DYNAMO=$ENABLE_DYNAMO"
 echo "INSTALL_SENTINEL=${INSTALL_SENTINEL:-<token>}"
+echo "GRPC_BIND=${GRPC_BIND:-<keep>}"
+echo "OOBE=$OOBE"
 
 # Rewrites config.json through jq; the arguments are jq's, without the file.
 # config.json stays 0600 and owned by the service user, as `noded --init`
@@ -189,7 +203,9 @@ if [ "$INSECURE" = "true" ]; then
     INSECURE_ARG="--insecure"
     echo "[WARN] INSECURE=true: TLS certificates of the managers are not verified"
 fi
-sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --lb-pool="${LB_POOL}" --public-ip="${PUBLIC_IP}" --enable-dynamo="${ENABLE_DYNAMO}" --install-sentinel="${INSTALL_SENTINEL}" $TEST_ARG $INSECURE_ARG
+OOBE_ARG=""
+[ "$OOBE" = "true" ] && OOBE_ARG="--oobe"
+sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --lb-pool="${LB_POOL}" --public-ip="${PUBLIC_IP}" --enable-dynamo="${ENABLE_DYNAMO}" --install-sentinel="${INSTALL_SENTINEL}" $TEST_ARG $INSECURE_ARG $OOBE_ARG
 
 # The redeemed token's initial_state may have just disabled dynamo (recorded
 # in the marker by --init). Honor it in this same run: it decides whether the
@@ -574,6 +590,11 @@ if [ -z "$CURRENT_CSP" ]; then
     fi
 fi
 
+if [ -n "$GRPC_BIND" ] && [ -f "$CONFIG_PATH" ]; then
+    echo "[*] Binding noded's gRPC server to $GRPC_BIND"
+    patch_config --arg bind "$GRPC_BIND" '.grpc_bind = $bind'
+fi
+
 # --- 7. Systemd Integration ---
 echo "[*] Configuring systemd services..."
 # --insecure reaches the running agents through their ExecStart lines. The
@@ -620,24 +641,30 @@ for svc in $DYNAMO_SERVICES; do
 done
 
 # Stator is enabled on every node; it is started below once stator.json is
-# in place.
-sudo systemctl enable "$STATOR_SERVICE"
-if [ "$ENABLE_DYNAMO" = false ]; then
+# in place. An out-of-box node has no identity for the agents to start with,
+# so they stay disabled, as `noded --oobe` leaves them, until
+# `noded --enable-units`.
+if [ "$OOBE" = true ]; then
+    echo "[*] Out-of-box install: leaving the agent units disabled."
+    sudo systemctl disable "$STATOR_SERVICE" $CORE_SERVICES 2>/dev/null || true
+elif [ "$ENABLE_DYNAMO" = false ]; then
     # Stator is the only enabled agent. dynamo's units stay present but
     # disabled (a converted node also lands here); the firewall is handled by
     # the marker logic below, which init leaves absent when dynamo is off.
+    sudo systemctl enable "$STATOR_SERVICE"
     sudo systemctl disable $CORE_SERVICES 2>/dev/null || true
 else
     # Enable the units, but don't start them yet: app-proxy nodes must bring up
     # the node-proxy container first, and starting the dynamo service (which
     # performs RegisterNode) is the last step for both node kinds.
+    sudo systemctl enable "$STATOR_SERVICE"
     sudo systemctl enable $CORE_SERVICES
 fi
 
 # Enable the firewall only when init marked this node for it. The marker is
 # absent for VPN nodes, dynamoless nodes and app proxies (see the init step
 # above), so the unit, the marker and firewall_addr in config.json always agree.
-if [ -f "$FIREWALL_MARKER" ]; then
+if [ "$OOBE" != true ] && [ -f "$FIREWALL_MARKER" ]; then
     ENABLE_FIREWALL=true
 else
     ENABLE_FIREWALL=false
@@ -866,23 +893,32 @@ STATOR_WALLET=$(printf '%s' "$NEW_STATOR_JSON" | jq -r '.key_manager.wallet_file
 if [ -n "$STATOR_WALLET" ] && [ "$STATOR_WALLET" != "$INSTALL_ROOT/node.key" ] && [ -f "$INSTALL_ROOT/node.key" ]; then
     echo "[WARN] $INSTALL_ROOT/node.key exists but the node identity is $STATOR_WALLET; the stray file is unused"
 fi
-echo "[*] Starting stator..."
-sudo systemctl restart "$STATOR_SERVICE"
+if [ "$OOBE" = true ]; then
+    echo "[*] Out-of-box install: no agent is started."
+else
+    echo "[*] Starting stator..."
+    sudo systemctl restart "$STATOR_SERVICE"
 
-if [ "$ENABLE_DYNAMO" = true ]; then
-    # Start the dynamo services last (-> RegisterNode). Order relative to
-    # Stator does not matter: the two agents report independently.
-    echo "[*] Starting dynamo services..."
-    sudo systemctl start $CORE_SERVICES
-    if [ "$ENABLE_FIREWALL" = true ]; then
-        sudo systemctl start "$FIREWALL_SERVICE"
+    if [ "$ENABLE_DYNAMO" = true ]; then
+        # Start the dynamo services last (-> RegisterNode). Order relative to
+        # Stator does not matter: the two agents report independently.
+        echo "[*] Starting dynamo services..."
+        sudo systemctl start $CORE_SERVICES
+        if [ "$ENABLE_FIREWALL" = true ]; then
+            sudo systemctl start "$FIREWALL_SERVICE"
+        fi
     fi
 fi
 
 # --- 8. Verification ---
 # Stator runs on every node and shares dynamo's identity, so it reports the
-# build and the node address for both node types.
-output=$(sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/stator" --version --config="$STATOR_CONFIG" 2>/dev/null)
+# build and the node address for both node types. An out-of-box node has no
+# address yet, so only the build is reported.
+if [ "$OOBE" = true ]; then
+    output=$(sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/stator" --version 2>/dev/null)
+else
+    output=$(sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/stator" --version --config="$STATOR_CONFIG" 2>/dev/null)
+fi
 rc=$?
 if [ "$rc" -ne 0 ]; then
     echo "[FAIL] Dynamo installation failed"
@@ -896,3 +932,7 @@ echo "Install directory: ${INSTALL_ROOT}"
 echo "Config file: ${CONFIG_PATH}"
 echo "Service user: ${SERVICE_USER}"
 echo "${output}"
+if [ "$OOBE" = true ]; then
+    echo
+    echo 'The node is out-of-box. Provision it with `noded --init=<token>`, then start it with `noded --enable-units` (as root).'
+fi
