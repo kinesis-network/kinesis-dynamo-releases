@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.27
+# Kinesis Dynamo Bootstrap Script: v0.4.28
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -19,6 +19,18 @@ FOR_TEST=${FOR_TEST:-false}
 # trusted certificate, e.g. locally hosted managers. Not persisted: a re-run
 # without it, a self-upgrade included, verifies again.
 INSECURE=${INSECURE:-false}
+# The address noded's gRPC server binds (config.json grpc_bind), e.g.
+# tcp://0.0.0.0:50002 for a WSL2 distro that Spark reaches from Windows.
+# Passed to `noded --init`; empty keeps the node's current value, and a node
+# that never had one binds noded's default unix socket.
+GRPC_BIND=${GRPC_BIND:-""}
+# OOBE=true installs the node out-of-box, for an image that is cloned (Spark
+# venue PCs): `noded --init --oobe` writes the config a provision would
+# without an identity or a call to the Node Manager, so no token is used, and
+# the agent units stay disabled. Each clone then runs `noded --init=<token>`
+# and `noded --enable-units`. Takes no PROVISION_TOKEN (an @<host>:<port>
+# manager list is fine). Not persisted: a later run installs a normal node.
+OOBE=${OOBE:-false}
 DYNAMO_SERVICES="dynamo.service dynamo-admin.service dynamo-gpu-enforcer.service dynamo-gpu-enforcer.path dynamo-firewall.service"
 STATOR_SERVICE="dynamo-stator.service"
 
@@ -26,16 +38,13 @@ STATOR_SERVICE="dynamo-stator.service"
 # ENABLE_DYNAMO=false provisions a dynamoless node: the customer uses it over
 # SSH and Stator, not dynamo, is the admin agent. This is an install-time
 # posture, not a node class -- the owner may start or stop dynamo freely
-# afterwards. The decision is recorded in a marker (dynamo.disabled; negative
-# so legacy nodes without it keep running dynamo), so re-runs keep the posture
-# without re-passing the variable; an explicit ENABLE_DYNAMO on a re-run
-# converts the node.
-ENABLE_DYNAMO_EXPLICIT="${ENABLE_DYNAMO:-}"
-ENABLE_DYNAMO="$ENABLE_DYNAMO_EXPLICIT"
-if [ -z "$ENABLE_DYNAMO" ] && [ -f "$INSTALL_ROOT/dynamo.disabled" ]; then
-    ENABLE_DYNAMO=false
-fi
-[ "$ENABLE_DYNAMO" = "false" ] || ENABLE_DYNAMO=true
+# afterwards. Passed to `noded --init`, which records the decision in a marker
+# (dynamo.disabled; negative so legacy nodes without it keep running dynamo)
+# and otherwise keeps the marker, so re-runs keep the posture without
+# re-passing the variable; an explicit ENABLE_DYNAMO on a re-run converts the
+# node, and a redeemed token's initial_state can disable dynamo too. The
+# marker, as init leaves it, decides the rest of this run.
+ENABLE_DYNAMO=${ENABLE_DYNAMO:-""}
 DOCKER_DATA_ROOT=${DOCKER_DATA_ROOT:-""}
 CONTAINERD_ROOT=${CONTAINERD_ROOT:-""}
 
@@ -82,8 +91,10 @@ echo "IS_WSL=$IS_WSL"
 echo "OS_ARCH=$OS_ARCH"
 echo "DOCKER_DATA_ROOT=${DOCKER_DATA_ROOT:-<default>}"
 echo "CONTAINERD_ROOT=${CONTAINERD_ROOT:-<default>}"
-echo "ENABLE_DYNAMO=$ENABLE_DYNAMO"
+echo "ENABLE_DYNAMO=${ENABLE_DYNAMO:-<keep>}"
 echo "INSTALL_SENTINEL=${INSTALL_SENTINEL:-<token>}"
+echo "GRPC_BIND=${GRPC_BIND:-<keep>}"
+echo "OOBE=$OOBE"
 
 # Rewrites config.json through jq; the arguments are jq's, without the file.
 # config.json stays 0600 and owned by the service user, as `noded --init`
@@ -103,6 +114,37 @@ sudo apt-get install -y jq curl gnupg lsb-release libarchive-tools pciutils
 
 sudo usermod -aG systemd-journal "$SERVICE_USER"
 
+# --- 4. Download Release ---
+# The release is fetched from github.com, not api.github.com: the REST API
+# allows 60 unauthenticated requests per hour per public IP, which nodes
+# behind a shared IP (CGNAT, office NAT) run out of. It is fetched before any
+# service is stopped, so a bad tag or a failed download leaves the node as it
+# was.
+echo "[*] Downloading Kinesis Dynamo (${RELEASE_VERSION})..."
+REPO="kinesis-network/kinesis-dynamo-releases"
+if [ "$RELEASE_VERSION" = "latest" ]; then
+    # /releases/latest redirects to /releases/tag/<latest stable tag>.
+    LATEST_URL=$(curl -sS -o /dev/null -w '%{redirect_url}' "https://github.com/$REPO/releases/latest") || LATEST_URL=""
+    case "$LATEST_URL" in
+        */releases/tag/?*) RELEASE_TAG="${LATEST_URL##*/}" ;;
+        *)
+            echo "Failed to resolve the latest release of $REPO (redirect: ${LATEST_URL:-<none>})"
+            exit 1
+            ;;
+    esac
+    echo "[*] Latest release: $RELEASE_TAG"
+else
+    RELEASE_TAG="$RELEASE_VERSION"
+fi
+
+ASSET_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/dynamo-$RELEASE_TAG-$OS_ARCH.zip"
+echo "[*] Fetching asset: $ASSET_URL"
+if ! curl -fsSL --retry 3 -o /tmp/dynamo.zip "$ASSET_URL"; then
+    rm -f /tmp/dynamo.zip
+    echo "Failed to download the $OS_ARCH asset of release $RELEASE_TAG. Check that the release exists: https://github.com/$REPO/releases/tag/$RELEASE_TAG"
+    exit 1
+fi
+
 # --- 4.5 Stop existing services if they exist ---
 echo "[*] Checking for existing services..."
 for svc in $DYNAMO_SERVICES $STATOR_SERVICE; do
@@ -112,25 +154,8 @@ for svc in $DYNAMO_SERVICES $STATOR_SERVICE; do
     fi
 done
 
-# --- 5. Download & Extract Release ---
-echo "[*] Downloading Kinesis Dynamo (${RELEASE_VERSION})..."
-REPO="kinesis-network/kinesis-dynamo-releases"
-if [ "$RELEASE_VERSION" = "latest" ]; then
-    REL_DATA=$(curl -sL "https://api.github.com/repos/$REPO/releases/latest")
-else
-    REL_DATA=$(curl -sL "https://api.github.com/repos/$REPO/releases/tags/$RELEASE_VERSION")
-fi
-
-# Extract the specific zip URL for the detected architecture
-ASSET_URL=$(echo "$REL_DATA" | jq -r --arg arch "$OS_ARCH" '.assets[] | select(.name | test("dynamo-.*-" + $arch + "\\.zip$")) | .url')
-if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
-    echo "Failed to find a .zip asset for $OS_ARCH in release $RELEASE_VERSION"
-    exit 1
-fi
-echo "[*] Found asset: $ASSET_URL"
-
+# --- 5. Extract Release ---
 sudo mkdir -p "$INSTALL_ROOT/mounts"
-curl -sL -H "Accept: application/octet-stream" -o /tmp/dynamo.zip "$ASSET_URL"
 sudo bsdtar -xvf /tmp/dynamo.zip -C "$INSTALL_ROOT"
 sudo chown -R "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_ROOT"
 sudo rm /tmp/dynamo.zip
@@ -145,45 +170,26 @@ echo "[*] Running gRPC initialization..."
 # pre-registers the proxy and writes the bundle to $PROXY_DIR.
 TEST_ARG=""
 [ "$FOR_TEST" = "true" ] && TEST_ARG="--test"
-# An explicitly passed posture is recorded in the marker here too: --init only
-# rewrites it when a token is redeemed, and posture conversions re-run without
-# one.
-if [ "$ENABLE_DYNAMO_EXPLICIT" = "false" ]; then
-    sudo -u "$SERVICE_USER" touch "$INSTALL_ROOT/dynamo.disabled"
-elif [ -n "$ENABLE_DYNAMO_EXPLICIT" ]; then
-    sudo rm -f "$INSTALL_ROOT/dynamo.disabled"
-fi
 # The marker is the single source of truth for the firewall, written (or
-# removed) by `noded --init` when it redeems a token, and reconciled into
-# plugins.docker.firewall_addr in config.json on every init. Below it only
-# decides whether the systemd unit runs.
+# removed) by `noded --init` when it redeems a token (and dropped on an app
+# proxy from an older release), and reconciled into plugins.docker.firewall_addr
+# in config.json on every init. Below it only decides whether the systemd unit
+# runs.
 FIREWALL_MARKER="${INSTALL_ROOT}/firewall.enabled"
-# App proxies never run the firewall (kinesis-firewall isn't integrated with
-# the proxy service yet). Init leaves the marker absent for a proxy token, but
-# a proxy provisioned by an older release still carries one, and a re-install
-# runs init without a token, which keeps the marker as is. Drop it here so
-# init's reconcile step strips firewall_addr from config.json to match (dynamo
-# otherwise keeps dialing a firewall socket that is never there). proxy.env
-# only exists on an already-provisioned proxy; a fresh proxy install is handled
-# by init itself.
-if [ -f "$PROXY_DIR/proxy.env" ] && [ -f "$FIREWALL_MARKER" ]; then
-    echo "[*] App proxy: removing stale firewall marker."
-    sudo rm -f "$FIREWALL_MARKER"
-fi
 INSECURE_ARG=""
 if [ "$INSECURE" = "true" ]; then
     INSECURE_ARG="--insecure"
     echo "[WARN] INSECURE=true: TLS certificates of the managers are not verified"
 fi
-sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --lb-pool="${LB_POOL}" --public-ip="${PUBLIC_IP}" --enable-dynamo="${ENABLE_DYNAMO}" --install-sentinel="${INSTALL_SENTINEL}" $TEST_ARG $INSECURE_ARG
+OOBE_ARG=""
+[ "$OOBE" = "true" ] && OOBE_ARG="--oobe"
+sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --lb-pool="${LB_POOL}" --public-ip="${PUBLIC_IP}" --enable-dynamo="${ENABLE_DYNAMO}" --grpc-bind="${GRPC_BIND}" --install-sentinel="${INSTALL_SENTINEL}" $TEST_ARG $INSECURE_ARG $OOBE_ARG
 
-# The redeemed token's initial_state may have just disabled dynamo (recorded
-# in the marker by --init). Honor it in this same run: it decides whether the
-# container runtime is installed below and which agent is enabled after that.
-# An explicit ENABLE_DYNAMO from the caller still wins.
-if [ -z "$ENABLE_DYNAMO_EXPLICIT" ] && [ -f "$INSTALL_ROOT/dynamo.disabled" ]; then
-    ENABLE_DYNAMO=false
-fi
+# The posture init recorded -- from ENABLE_DYNAMO, the marker a previous run
+# left, or the redeemed token's initial_state -- decides whether the container
+# runtime is installed below and which agent is enabled after that.
+ENABLE_DYNAMO=true
+[ -f "$INSTALL_ROOT/dynamo.disabled" ] && ENABLE_DYNAMO=false
 
 # The whole container-runtime section is skipped wholesale on a dynamoless
 # node: none of it belongs there, and mutating Docker config on a BYOD machine
@@ -530,35 +536,8 @@ fi
 
 fi # ENABLE_DYNAMO: end of the container-runtime setup
 
-# Detect the cloud provider and patch its metadata into the config, but only
-# when it is not recorded yet, so re-running install.sh on an existing node
-# respects its current values.
-CURRENT_CSP=""
-[ -f "$CONFIG_PATH" ] && CURRENT_CSP=$(sudo -u "$SERVICE_USER" jq -r '.csp // ""' "$CONFIG_PATH")
-if [ -z "$CURRENT_CSP" ]; then
-    echo "[*] Detecting Cloud Provider..."
-    CSP="manual"; REGION="unknown"; ZONE="unknown"
-    # Define common curl timeout settings
-    # --connect-timeout: max time to wait for connection
-    # -m, --max-time: max time for the whole operation
-    TIMEOUT_FLAGS="--connect-timeout 2 --max-time 3"
-    # AWS IMDSv2
-    if TOKEN=$(curl $TIMEOUT_FLAGS -fsS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null); then
-        ZONE=$(curl $TIMEOUT_FLAGS -fsS -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/placement/availability-zone")
-        REGION="${ZONE%[a-z]}"; CSP="aws"
-    # Azure
-    elif REGION=$(curl $TIMEOUT_FLAGS -fsS -H "Metadata: true" "http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text" 2>/dev/null); then
-        CSP="azure"; ZONE=$(curl $TIMEOUT_FLAGS -fsS -H "Metadata: true" "http://169.254.169.254/metadata/instance/compute/zone?api-version=2021-02-01&format=text" 2>/dev/null || echo "1")
-    fi
-    echo "[*] Provider: $CSP ($REGION / $ZONE)"
-
-    if [ -f "$CONFIG_PATH" ]; then
-        echo "[*] Patching configuration..."
-        patch_config \
-            --arg csp "$CSP" --arg reg "$REGION" --arg zone "$ZONE" \
-            '. + {csp: $csp, csp_region: $reg, csp_zone: $zone}'
-    fi
-fi
+# The cloud provider (csp, csp_region, csp_zone) and grpc_bind are recorded by
+# `noded --init` above.
 
 # --- 7. Systemd Integration ---
 echo "[*] Configuring systemd services..."
@@ -606,24 +585,30 @@ for svc in $DYNAMO_SERVICES; do
 done
 
 # Stator is enabled on every node; it is started below once stator.json is
-# in place.
-sudo systemctl enable "$STATOR_SERVICE"
-if [ "$ENABLE_DYNAMO" = false ]; then
+# in place. An out-of-box node has no identity for the agents to start with,
+# so they stay disabled, as `noded --oobe` leaves them, until
+# `noded --enable-units`.
+if [ "$OOBE" = true ]; then
+    echo "[*] Out-of-box install: leaving the agent units disabled."
+    sudo systemctl disable "$STATOR_SERVICE" $CORE_SERVICES 2>/dev/null || true
+elif [ "$ENABLE_DYNAMO" = false ]; then
     # Stator is the only enabled agent. dynamo's units stay present but
     # disabled (a converted node also lands here); the firewall is handled by
     # the marker logic below, which init leaves absent when dynamo is off.
+    sudo systemctl enable "$STATOR_SERVICE"
     sudo systemctl disable $CORE_SERVICES 2>/dev/null || true
 else
     # Enable the units, but don't start them yet: app-proxy nodes must bring up
     # the node-proxy container first, and starting the dynamo service (which
     # performs RegisterNode) is the last step for both node kinds.
+    sudo systemctl enable "$STATOR_SERVICE"
     sudo systemctl enable $CORE_SERVICES
 fi
 
 # Enable the firewall only when init marked this node for it. The marker is
 # absent for VPN nodes, dynamoless nodes and app proxies (see the init step
 # above), so the unit, the marker and firewall_addr in config.json always agree.
-if [ -f "$FIREWALL_MARKER" ]; then
+if [ "$OOBE" != true ] && [ -f "$FIREWALL_MARKER" ]; then
     ENABLE_FIREWALL=true
 else
     ENABLE_FIREWALL=false
@@ -809,66 +794,35 @@ elif command -v docker >/dev/null 2>&1; then
     fi
 fi
 
-# Write Stator's config -- on every node, on every run. It is derived from
-# dynamo's config.json (written by `noded --init`), which is the source of
-# truth for the node identity and the manager-manager list: nodes provisioned
-# before node.key was the default keep their wallet at another path, and a
-# Stator pointed at a missing file refuses to start rather than mint a second
-# identity the Node Manager has never seen. Stator itself still does not parse
-# config.json (that schema is dynamo's to change); the derivation happens
-# here, once, and stator.json stays the whole contract. Keys already present
-# in stator.json that are not derived here (operator overrides such as
-# poll_interval_sec) are preserved.
+# Stator's config is derived from dynamo's config.json by `noded --init` above,
+# on every node and every run. Here it only names the file for the check below.
 STATOR_CONFIG="$INSTALL_ROOT/stator.json"
-MM_LIST="${PROVISION_TOKEN#*@}"
-[ "$MM_LIST" = "$PROVISION_TOKEN" ] && MM_LIST=""
-DYNAMO_JSON="{}"
-[ -f "$CONFIG_PATH" ] && DYNAMO_JSON=$(sudo -u "$SERVICE_USER" cat "$CONFIG_PATH")
-STATOR_JSON="{}"
-[ -f "$STATOR_CONFIG" ] && STATOR_JSON=$(sudo -u "$SERVICE_USER" cat "$STATOR_CONFIG")
-if NEW_STATOR_JSON=$(printf '%s' "$STATOR_JSON" | sudo -u "$SERVICE_USER" jq \
-        --argjson dynamo "$DYNAMO_JSON" \
-        --arg universe "$UNIVERSE" \
-        --arg ssh_user "$SERVICE_USER" \
-        --arg wallet "$INSTALL_ROOT/node.key" \
-        --arg admin_key "$INSTALL_ROOT/admin-ssh.pub" \
-        --arg mm "$MM_LIST" \
-        '. + {universe: ($dynamo.universe // $universe),
-              ssh_user: $ssh_user,
-              key_manager: ($dynamo.key_manager // {type: "plaintext", wallet_file: $wallet}),
-              admin_ssh_key_file: $admin_key}
-         + (if $dynamo.mm_list then {mm_list: $dynamo.mm_list}
-            elif $mm != "" then {mm_list: ($mm | split("@"))}
-            else {} end)'); then
-    printf '%s\n' "$NEW_STATOR_JSON" | sudo -u "$SERVICE_USER" tee "$STATOR_CONFIG" > /dev/null
-    echo "[*] Wrote $STATOR_CONFIG"
+if [ "$OOBE" = true ]; then
+    echo "[*] Out-of-box install: no agent is started."
 else
-    echo "[WARN] Cannot derive $STATOR_CONFIG from $CONFIG_PATH; keeping the existing one"
-fi
-# A stray node.key beside a differently named wallet is what an earlier Stator
-# left behind when it minted an identity of its own. Nothing reads it any
-# more; flag it so an operator can remove it deliberately.
-STATOR_WALLET=$(printf '%s' "$NEW_STATOR_JSON" | jq -r '.key_manager.wallet_file // ""' 2>/dev/null || true)
-if [ -n "$STATOR_WALLET" ] && [ "$STATOR_WALLET" != "$INSTALL_ROOT/node.key" ] && [ -f "$INSTALL_ROOT/node.key" ]; then
-    echo "[WARN] $INSTALL_ROOT/node.key exists but the node identity is $STATOR_WALLET; the stray file is unused"
-fi
-echo "[*] Starting stator..."
-sudo systemctl restart "$STATOR_SERVICE"
+    echo "[*] Starting stator..."
+    sudo systemctl restart "$STATOR_SERVICE"
 
-if [ "$ENABLE_DYNAMO" = true ]; then
-    # Start the dynamo services last (-> RegisterNode). Order relative to
-    # Stator does not matter: the two agents report independently.
-    echo "[*] Starting dynamo services..."
-    sudo systemctl start $CORE_SERVICES
-    if [ "$ENABLE_FIREWALL" = true ]; then
-        sudo systemctl start "$FIREWALL_SERVICE"
+    if [ "$ENABLE_DYNAMO" = true ]; then
+        # Start the dynamo services last (-> RegisterNode). Order relative to
+        # Stator does not matter: the two agents report independently.
+        echo "[*] Starting dynamo services..."
+        sudo systemctl start $CORE_SERVICES
+        if [ "$ENABLE_FIREWALL" = true ]; then
+            sudo systemctl start "$FIREWALL_SERVICE"
+        fi
     fi
 fi
 
 # --- 8. Verification ---
 # Stator runs on every node and shares dynamo's identity, so it reports the
-# build and the node address for both node types.
-output=$(sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/stator" --version --config="$STATOR_CONFIG" 2>/dev/null)
+# build and the node address for both node types. An out-of-box node has no
+# address yet, so only the build is reported.
+if [ "$OOBE" = true ]; then
+    output=$(sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/stator" --version 2>/dev/null)
+else
+    output=$(sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/stator" --version --config="$STATOR_CONFIG" 2>/dev/null)
+fi
 rc=$?
 if [ "$rc" -ne 0 ]; then
     echo "[FAIL] Dynamo installation failed"
@@ -882,3 +836,7 @@ echo "Install directory: ${INSTALL_ROOT}"
 echo "Config file: ${CONFIG_PATH}"
 echo "Service user: ${SERVICE_USER}"
 echo "${output}"
+if [ "$OOBE" = true ]; then
+    echo
+    echo 'The node is out-of-box. Provision it with `noded --init=<token>`, then start it with `noded --enable-units` (as root).'
+fi
