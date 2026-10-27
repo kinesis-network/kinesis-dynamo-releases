@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.4.28
+# Kinesis Dynamo Bootstrap Script: v0.5.0
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -59,9 +59,9 @@ SENTINEL_IMAGE=${SENTINEL_IMAGE:-"kinesisorg/kinesis-sentinel"}
 SENTINEL_CONTAINER="kinesis-sentinel"
 
 # App-proxy provisioning (only used when PROVISION_TOKEN is a proxy token; for a
-# normal node these are empty/unused). LB_POOL / PUBLIC_IP are passed through to
-# `noded --init`, which pre-registers the proxy and writes a bundle to $PROXY_DIR.
-LB_POOL=${LB_POOL:-""}
+# normal node this is empty/unused). PUBLIC_IP is passed through to `noded
+# --init`, which pre-registers the proxy and writes a bundle to $PROXY_DIR. The
+# proxy pool is not an input: the managers know it from the token.
 PUBLIC_IP=${PUBLIC_IP:-""}
 PROXY_DIR="$INSTALL_ROOT/proxy"
 NODE_PROXY_IMAGE=${NODE_PROXY_IMAGE:-"kinesisorg/node-proxy"}
@@ -165,8 +165,8 @@ sudo rm /tmp/dynamo.zip
 # step decides for itself whether it applies, so an already-provisioned node
 # keeps its wallet and config and only has derived state reconciled.
 echo "[*] Running gRPC initialization..."
-# --lb-pool / --public-ip are only meaningful for a proxy token; for a normal
-# node they are empty and init ignores them. For a proxy token, init also
+# --public-ip is only meaningful for a proxy token; for a normal node it is
+# empty and init ignores it. For a proxy token, init also
 # pre-registers the proxy and writes the bundle to $PROXY_DIR.
 TEST_ARG=""
 [ "$FOR_TEST" = "true" ] && TEST_ARG="--test"
@@ -183,7 +183,7 @@ if [ "$INSECURE" = "true" ]; then
 fi
 OOBE_ARG=""
 [ "$OOBE" = "true" ] && OOBE_ARG="--oobe"
-sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --lb-pool="${LB_POOL}" --public-ip="${PUBLIC_IP}" --enable-dynamo="${ENABLE_DYNAMO}" --grpc-bind="${GRPC_BIND}" --install-sentinel="${INSTALL_SENTINEL}" $TEST_ARG $INSECURE_ARG $OOBE_ARG
+sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --public-ip="${PUBLIC_IP}" --enable-dynamo="${ENABLE_DYNAMO}" --grpc-bind="${GRPC_BIND}" --install-sentinel="${INSTALL_SENTINEL}" $TEST_ARG $INSECURE_ARG $OOBE_ARG
 
 # The posture init recorded -- from ENABLE_DYNAMO, the marker a previous run
 # left, or the redeemed token's initial_state -- decides whether the container
