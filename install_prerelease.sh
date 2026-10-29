@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.5.0-beta1
+# Kinesis Dynamo Bootstrap Script: v0.5.1-beta1
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -31,6 +31,11 @@ GRPC_BIND=${GRPC_BIND:-""}
 # and `noded --enable-units`. Takes no PROVISION_TOKEN (an @<host>:<port>
 # manager list is fine). Not persisted: a later run installs a normal node.
 OOBE=${OOBE:-false}
+# ONLINE=true makes a run without PROVISION_TOKEN read the node's attributes,
+# proxy role and admin SSH key from the Node Manager (`noded --init --online`)
+# instead of keeping what is on disk, and fail when it cannot be reached: it
+# finishes an install that failed after its token was redeemed. Not persisted.
+ONLINE=${ONLINE:-false}
 DYNAMO_SERVICES="dynamo.service dynamo-admin.service dynamo-gpu-enforcer.service dynamo-gpu-enforcer.path dynamo-firewall.service"
 STATOR_SERVICE="dynamo-stator.service"
 
@@ -95,6 +100,7 @@ echo "ENABLE_DYNAMO=${ENABLE_DYNAMO:-<keep>}"
 echo "INSTALL_SENTINEL=${INSTALL_SENTINEL:-<token>}"
 echo "GRPC_BIND=${GRPC_BIND:-<keep>}"
 echo "OOBE=$OOBE"
+echo "ONLINE=$ONLINE"
 
 # Rewrites config.json through jq; the arguments are jq's, without the file.
 # config.json stays 0600 and owned by the service user, as `noded --init`
@@ -183,7 +189,9 @@ if [ "$INSECURE" = "true" ]; then
 fi
 OOBE_ARG=""
 [ "$OOBE" = "true" ] && OOBE_ARG="--oobe"
-sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --public-ip="${PUBLIC_IP}" --enable-dynamo="${ENABLE_DYNAMO}" --grpc-bind="${GRPC_BIND}" --install-sentinel="${INSTALL_SENTINEL}" $TEST_ARG $INSECURE_ARG $OOBE_ARG
+ONLINE_ARG=""
+[ "$ONLINE" = "true" ] && ONLINE_ARG="--online"
+sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --public-ip="${PUBLIC_IP}" --enable-dynamo="${ENABLE_DYNAMO}" --grpc-bind="${GRPC_BIND}" --install-sentinel="${INSTALL_SENTINEL}" $TEST_ARG $INSECURE_ARG $OOBE_ARG $ONLINE_ARG
 
 # The posture init recorded -- from ENABLE_DYNAMO, the marker a previous run
 # left, or the redeemed token's initial_state -- decides whether the container
