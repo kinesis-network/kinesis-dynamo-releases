@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.5.5-beta1
+# Kinesis Dynamo Bootstrap Script: v0.5.5-beta2
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -36,9 +36,6 @@ OOBE=${OOBE:-false}
 # instead of keeping what is on disk, and fail when it cannot be reached: it
 # finishes an install that failed after its token was redeemed. Not persisted.
 ONLINE=${ONLINE:-false}
-# The free space, in MiB, install.sh needs on each filesystem it writes to
-# (apt's cache and /usr, /tmp, INSTALL_ROOT) before it starts.
-MIN_FREE_MB=${MIN_FREE_MB:-1024}
 DYNAMO_SERVICES="dynamo.service dynamo-admin.service dynamo-gpu-enforcer.service dynamo-gpu-enforcer.path dynamo-firewall.service"
 STATOR_SERVICE="dynamo-stator.service"
 
@@ -116,40 +113,21 @@ patch_config() {
     fi
 }
 
-# Exits unless the filesystem holding $1 -- or its nearest existing parent,
-# for a directory not created yet -- has MIN_FREE_MB MiB available.
-require_free_space() {
-    dir=$1
-    while [ ! -e "$dir" ]; do dir=$(dirname "$dir"); done
-    avail_kb=$(df -Pk "$dir" | awk 'NR == 2 { print $4 }')
-    if [ "$avail_kb" -lt $((MIN_FREE_MB * 1024)) ]; then
-        mount=$(df -P "$dir" | awk 'NR == 2 { print $6 }')
-        echo "[!] Not enough disk space for $1: $((avail_kb / 1024)) MiB free on $mount, $MIN_FREE_MB MiB needed."
-        echo "[!] Free up space (e.g. sudo apt-get clean, sudo journalctl --vacuum-size=100M, unused Docker images) or grow the disk, then re-run."
-        exit 1
-    fi
-}
-
-# --- 3. Install Core Dependencies ---
-# A full disk stops dpkg partway and leaves packages that apt-get then reports
-# as unmet dependencies, so the space is checked before apt-get runs.
-for path in /var/cache/apt/archives /usr /tmp "$INSTALL_ROOT"; do
-    require_free_space "$path"
-done
-
-echo "[*] Installing system dependencies..."
-sudo apt-get update -y
-# A dpkg run cut short (a full disk, a power loss, a killed
-# unattended-upgrades) leaves packages unconfigured or missing dependencies,
-# and apt-get install then refuses every package. Finish the configuration and
-# install the missing dependencies; --no-remove makes apt-get fail instead of
-# removing packages to get there.
-if ! sudo apt-get check >/dev/null 2>&1; then
-    echo "[*] Repairing interrupted package installs..."
-    sudo dpkg --configure -a
-    sudo apt-get install -f -y --no-remove
+# --- 3. Tools the install needs ---
+# The release is downloaded with curl and unpacked with bsdtar, and
+# config.json is edited with jq. Only a node that lacks one of them (a fresh
+# one) runs apt-get here. The rest of the apt packages, Docker and the NVIDIA
+# toolkit come after the release is installed (6.4), where a failure does
+# not stop the install.
+MISSING_TOOLS=""
+command -v curl >/dev/null 2>&1 || MISSING_TOOLS="$MISSING_TOOLS curl"
+command -v jq >/dev/null 2>&1 || MISSING_TOOLS="$MISSING_TOOLS jq"
+command -v bsdtar >/dev/null 2>&1 || MISSING_TOOLS="$MISSING_TOOLS libarchive-tools"
+if [ -n "$MISSING_TOOLS" ]; then
+    echo "[*] Installing$MISSING_TOOLS..."
+    sudo apt-get update -y
+    sudo apt-get install -y $MISSING_TOOLS
 fi
-sudo apt-get install -y jq curl gnupg lsb-release libarchive-tools pciutils
 
 sudo usermod -aG systemd-journal "$SERVICE_USER"
 
@@ -176,10 +154,25 @@ else
     RELEASE_TAG="$RELEASE_VERSION"
 fi
 
+# The archive is downloaded into INSTALL_ROOT, so one check covers it and
+# what it unpacks to: ~60 MiB and ~120 MiB as of v0.5.4. A full disk stops
+# the install here, before any service is stopped.
+MIN_FREE_MB=256
+sudo mkdir -p "$INSTALL_ROOT"
+FREE_MB=$(( $(df -Pk "$INSTALL_ROOT" | awk 'NR == 2 { print $4 }') / 1024 ))
+if [ "$FREE_MB" -lt "$MIN_FREE_MB" ]; then
+    echo "[!] Not enough disk space for $INSTALL_ROOT: $FREE_MB MiB free, $MIN_FREE_MB MiB needed."
+    exit 1
+fi
+
 ASSET_URL="https://github.com/$REPO/releases/download/$RELEASE_TAG/dynamo-$RELEASE_TAG-$OS_ARCH.zip"
+RELEASE_ZIP="$INSTALL_ROOT/dynamo-release.zip"
 echo "[*] Fetching asset: $ASSET_URL"
-if ! curl -fsSL --retry 3 -o /tmp/dynamo.zip "$ASSET_URL"; then
-    rm -f /tmp/dynamo.zip
+# curl runs as the caller, as it did into /tmp, so the caller's proxy
+# settings still apply; sudo would drop them.
+sudo install -m 644 -o "$(id -u)" /dev/null "$RELEASE_ZIP"
+if ! curl -fsSL --retry 3 -o "$RELEASE_ZIP" "$ASSET_URL"; then
+    sudo rm -f "$RELEASE_ZIP"
     echo "Failed to download the $OS_ARCH asset of release $RELEASE_TAG. Check that the release exists: https://github.com/$REPO/releases/tag/$RELEASE_TAG"
     exit 1
 fi
@@ -195,9 +188,9 @@ done
 
 # --- 5. Extract Release ---
 sudo mkdir -p "$INSTALL_ROOT/mounts"
-sudo bsdtar -xvf /tmp/dynamo.zip -C "$INSTALL_ROOT"
+sudo bsdtar -xvf "$RELEASE_ZIP" -C "$INSTALL_ROOT"
+sudo rm "$RELEASE_ZIP"
 sudo chown -R "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_ROOT"
-sudo rm /tmp/dynamo.zip
 
 # --- 6. Initialization & Config ---
 # --init runs on every install, including re-installs. It is idempotent: each
@@ -232,6 +225,59 @@ sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --ro
 ENABLE_DYNAMO=true
 [ -f "$INSTALL_ROOT/dynamo.disabled" ] && ENABLE_DYNAMO=false
 
+# --- 6.4. OS components ---
+# The release is installed by now. What follows -- apt packages, Docker, the
+# NVIDIA toolkit -- belongs to the OS, and a failure there does not stop the
+# install: each runs as a step (run_step), whose output is kept in
+# $INSTALL_LOG_DIR/<step>.log. A failed step goes to $STEPS_FILE with the end
+# of its output, for Stator to report (stator/installrun.go), and the steps
+# that need it are skipped. The script goes on to start the agents, and
+# exits with status 3 at the end.
+INSTALL_LOG_DIR="$INSTALL_ROOT/install-logs"
+STEPS_FILE="$INSTALL_ROOT/stator-install-run.steps"
+STEP_TAIL_LINES=20
+FAILED_STEPS=""
+sudo mkdir -p "$INSTALL_LOG_DIR"
+sudo rm -f "$STEPS_FILE"
+
+# Runs "$@" as the step named $1, and leaves its exit status in STEP_RC.
+# Call it as a plain command, never as the condition of an if, &&, || or !:
+# there the shell ignores set -e for everything the condition runs, the
+# subshell's own set -e included, so a step would go on past a failed
+# command. dash has no pipefail, so the status comes back through a file.
+run_step() {
+    step=$1
+    shift
+    log="$INSTALL_LOG_DIR/$step.log"
+    rc_file=$(mktemp)
+    echo "[*] Step: $step"
+    set +e
+    { ( set -e; "$@" ); echo $? > "$rc_file"; } 2>&1 | sudo tee "$log"
+    STEP_RC=$(cat "$rc_file")
+    STEP_RC=${STEP_RC:-1}
+    set -e
+    rm -f "$rc_file"
+    if [ "$STEP_RC" -ne 0 ]; then
+        echo "[!] Step $step failed with status $STEP_RC; going on without it"
+        FAILED_STEPS="$FAILED_STEPS $step"
+        { echo "$step: exit status $STEP_RC"; tail -n "$STEP_TAIL_LINES" "$log"; } \
+            | sudo tee -a "$STEPS_FILE" > /dev/null
+    fi
+}
+
+# A disk that filled up during an earlier apt run leaves dpkg half done, and
+# apt-get install then refuses every package until dpkg finishes.
+install_packages() {
+    if ! sudo apt-get check >/dev/null 2>&1; then
+        echo "[*] Finishing an interrupted package install..."
+        sudo dpkg --configure -a
+        sudo apt-get install -f -y --no-remove
+    fi
+    sudo apt-get update -y
+    sudo apt-get install -y jq curl gnupg lsb-release libarchive-tools pciutils
+}
+run_step packages install_packages
+
 # The whole container-runtime section is skipped wholesale on a dynamoless
 # node: none of it belongs there, and mutating Docker config on a BYOD machine
 # can break things the owner runs themselves. It runs after `noded --init` on
@@ -245,11 +291,14 @@ if [ "$ENABLE_DYNAMO" = false ]; then
 else
 
 # --- 6.5. Container Runtime (Docker/NVIDIA) ---
-# Docker Setup
+# Docker Setup. A step runs in a subshell, so what later steps read is set
+# out here.
 DOCKER_FRESH_INSTALL=false
-if ! command -v docker >/dev/null 2>&1; then
+command -v docker >/dev/null 2>&1 || DOCKER_FRESH_INSTALL=true
+DAEMON_JSON="/etc/docker/daemon.json"
+install_docker() {
+if [ "$DOCKER_FRESH_INSTALL" = true ]; then
     echo "[*] Installing Docker..."
-    DOCKER_FRESH_INSTALL=true
     sudo install -m 0755 -d /etc/apt/keyrings
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor --batch --yes -o /etc/apt/keyrings/docker.gpg
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | \
@@ -259,6 +308,12 @@ fi
 
 sudo systemctl enable --now docker
 sudo usermod -aG docker "$SERVICE_USER"
+}
+run_step docker install_docker
+DOCKER_STEP_RC=$STEP_RC
+
+# 6.6 to 6.8 edit Docker's config, which needs Docker installed.
+configure_docker() {
 
 # --- 6.6. Keep containers alive across daemon restarts ---
 # Docker's default is to SIGKILL every running container when dockerd stops, so
@@ -277,7 +332,6 @@ sudo usermod -aG docker "$SERVICE_USER"
 # swarm mode (unused on these nodes), and it does not carry containers across a
 # restart that changes daemon options such as data-root -- see 6.7, where such
 # a change is real and rare.
-DAEMON_JSON="/etc/docker/daemon.json"
 sudo mkdir -p /etc/docker
 if [ ! -s "$DAEMON_JSON" ]; then
     echo '{}' | sudo tee "$DAEMON_JSON" > /dev/null
@@ -449,6 +503,10 @@ if [ -n "$CONTAINERD_ROOT" ]; then
         sudo systemctl restart docker
     fi
 fi
+}
+if [ "$DOCKER_STEP_RC" -eq 0 ]; then
+    run_step docker-config configure_docker
+fi
 
 # --- 6.9. GPU Detection & Toolkit ---
 HAS_NVIDIA_GPU=false
@@ -458,7 +516,7 @@ else
     lspci | grep -qi nvidia && HAS_NVIDIA_GPU=true
 fi
 
-if [ "$HAS_NVIDIA_GPU" = true ]; then
+install_nvidia_toolkit() {
     echo "[*] NVIDIA GPU detected. Setting up Container Toolkit..."
     curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor --batch --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
     curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
@@ -490,12 +548,17 @@ if [ "$HAS_NVIDIA_GPU" = true ]; then
     else
         echo "[*] Docker already runs the nvidia runtime; skipping restart"
     fi
+}
+if [ "$HAS_NVIDIA_GPU" = true ] && [ "$DOCKER_STEP_RC" -eq 0 ]; then
+    run_step nvidia install_nvidia_toolkit
 fi
 
 # --- 6.9b. Report whether icc:false is live ---
 BRIDGE_ICC=$(sudo docker network inspect bridge \
     --format '{{index .Options "com.docker.network.bridge.enable_icc"}}' 2>/dev/null || true)
-if [ "$BRIDGE_ICC" = "false" ]; then
+if [ "$DOCKER_STEP_RC" -ne 0 ]; then
+    echo "[!] No Docker; skipped its config, the NVIDIA toolkit and the icc check"
+elif [ "$BRIDGE_ICC" = "false" ]; then
     echo "[*] Default bridge runs with icc disabled"
 else
     echo "[!] Default bridge still allows inter-container traffic; icc:false takes"
@@ -576,6 +639,11 @@ if [ -f "$CONFIG_PATH" ]; then
 fi
 
 fi # ENABLE_DYNAMO: end of the container-runtime setup
+
+# What runs containers below -- node-proxy, the sentinel, dynamo -- is not
+# started without Docker.
+DOCKER_RUNNING=false
+systemctl is-active --quiet docker && DOCKER_RUNNING=true
 
 # The cloud provider (csp, csp_region, csp_zone) and grpc_bind are recorded by
 # `noded --init` above.
@@ -667,7 +735,9 @@ fi
 # `noded --init` writes a bootstrap bundle ($PROXY_DIR/proxy.env) only when the
 # provisioning token is a proxy token. When present, stand up the node-proxy
 # container and activate the load balancer before starting the dynamo service.
-if [ -f "$PROXY_DIR/proxy.env" ]; then
+if [ -f "$PROXY_DIR/proxy.env" ] && [ "$DOCKER_RUNNING" = false ]; then
+    echo "[!] App proxy detected, but Docker is not running; node-proxy not started"
+elif [ -f "$PROXY_DIR/proxy.env" ]; then
     echo "[*] App proxy detected; setting up node-proxy container..."
     # proxy.env: ADMIN_HOST, MGMT_USERNAME, MGMT_PASSWORD, REDIS_ADDRS,
     # REDIS_MASTER_NAME, REDIS_PASSWORD, CACERT_BASE64, CERT_FILE
@@ -797,7 +867,9 @@ sentinel_containers() {
 if [ "$ENABLE_DYNAMO" = true ] && [ -f "$SENTINEL_MARKER" ]; then
     # A sentinel failure must not fail the install: dynamo runs without it,
     # only logging that the tetragon stream is down.
-    if [ ! -e /sys/kernel/btf/vmlinux ]; then
+    if [ "$DOCKER_RUNNING" = false ]; then
+        echo "[WARN] Sentinel enabled, but Docker is not running; not starting it"
+    elif [ ! -e /sys/kernel/btf/vmlinux ]; then
         echo "[WARN] Sentinel enabled, but the kernel has no BTF (/sys/kernel/btf/vmlinux); not starting it"
     else
         OLD_SENTINELS=$(sentinel_containers)
@@ -844,7 +916,9 @@ else
     echo "[*] Starting stator..."
     sudo systemctl restart "$STATOR_SERVICE"
 
-    if [ "$ENABLE_DYNAMO" = true ]; then
+    if [ "$ENABLE_DYNAMO" = true ] && [ "$DOCKER_RUNNING" = false ]; then
+        echo "[!] Docker is not running; the dynamo services are enabled but not started"
+    elif [ "$ENABLE_DYNAMO" = true ]; then
         # Start the dynamo services last (-> RegisterNode). Order relative to
         # Stator does not matter: the two agents report independently.
         echo "[*] Starting dynamo services..."
@@ -868,6 +942,14 @@ rc=$?
 if [ "$rc" -ne 0 ]; then
     echo "[FAIL] Dynamo installation failed"
     exit 1
+fi
+
+if [ -n "$FAILED_STEPS" ]; then
+    echo
+    echo "[!] dynamo is installed, but these steps failed:$FAILED_STEPS"
+    echo "    Their output is in $INSTALL_LOG_DIR. Fix the cause, then re-run install.sh."
+    echo "${output}"
+    exit 3
 fi
 
 echo
