@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.5.5-beta2
+# Kinesis Dynamo Bootstrap Script: v0.5.5-beta3
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -260,20 +260,29 @@ run_step() {
     if [ "$STEP_RC" -ne 0 ]; then
         echo "[!] Step $step failed with status $STEP_RC; going on without it"
         FAILED_STEPS="$FAILED_STEPS $step"
-        { echo "$step: exit status $STEP_RC"; tail -n "$STEP_TAIL_LINES" "$log"; } \
-            | sudo tee -a "$STEPS_FILE" > /dev/null
+        # apt's and dpkg's own errors name the cause, often far above the
+        # end of the output: a kernel install ends with grub's.
+        errors=$(grep -E -A2 '^(E: |dpkg: )' "$log" | head -n "$STEP_TAIL_LINES")
+        {
+            echo "$step: exit status $STEP_RC"
+            [ -z "$errors" ] || printf 'errors:\n%s\nlast lines:\n' "$errors"
+            tail -n "$STEP_TAIL_LINES" "$log"
+        } | sudo tee -a "$STEPS_FILE" > /dev/null
     fi
 }
 
 # A disk that filled up during an earlier apt run leaves dpkg half done, and
-# apt-get install then refuses every package until dpkg finishes.
+# apt-get install then refuses every package until dpkg finishes. dpkg
+# configures what was unpacked, but cannot fetch a dependency that never got
+# installed ("dependency problems - leaving unconfigured"); apt-get install
+# -f does, from the package lists the update just refreshed.
 install_packages() {
+    sudo apt-get update -y
     if ! sudo apt-get check >/dev/null 2>&1; then
         echo "[*] Finishing an interrupted package install..."
-        sudo dpkg --configure -a
+        sudo dpkg --configure -a || echo "[!] dpkg left packages unconfigured; trying apt-get install -f"
         sudo apt-get install -f -y --no-remove
     fi
-    sudo apt-get update -y
     sudo apt-get install -y jq curl gnupg lsb-release libarchive-tools pciutils
 }
 run_step packages install_packages
