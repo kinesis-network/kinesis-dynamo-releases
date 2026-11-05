@@ -36,6 +36,9 @@ OOBE=${OOBE:-false}
 # instead of keeping what is on disk, and fail when it cannot be reached: it
 # finishes an install that failed after its token was redeemed. Not persisted.
 ONLINE=${ONLINE:-false}
+# The free space, in MiB, install.sh needs on each filesystem it writes to
+# (apt's cache and /usr, /tmp, INSTALL_ROOT) before it starts.
+MIN_FREE_MB=${MIN_FREE_MB:-1024}
 DYNAMO_SERVICES="dynamo.service dynamo-admin.service dynamo-gpu-enforcer.service dynamo-gpu-enforcer.path dynamo-firewall.service"
 STATOR_SERVICE="dynamo-stator.service"
 
@@ -113,9 +116,39 @@ patch_config() {
     fi
 }
 
+# Exits unless the filesystem holding $1 -- or its nearest existing parent,
+# for a directory not created yet -- has MIN_FREE_MB MiB available.
+require_free_space() {
+    dir=$1
+    while [ ! -e "$dir" ]; do dir=$(dirname "$dir"); done
+    avail_kb=$(df -Pk "$dir" | awk 'NR == 2 { print $4 }')
+    if [ "$avail_kb" -lt $((MIN_FREE_MB * 1024)) ]; then
+        mount=$(df -P "$dir" | awk 'NR == 2 { print $6 }')
+        echo "[!] Not enough disk space for $1: $((avail_kb / 1024)) MiB free on $mount, $MIN_FREE_MB MiB needed."
+        echo "[!] Free up space (e.g. sudo apt-get clean, sudo journalctl --vacuum-size=100M, unused Docker images) or grow the disk, then re-run."
+        exit 1
+    fi
+}
+
 # --- 3. Install Core Dependencies ---
+# A full disk stops dpkg partway and leaves packages that apt-get then reports
+# as unmet dependencies, so the space is checked before apt-get runs.
+for path in /var/cache/apt/archives /usr /tmp "$INSTALL_ROOT"; do
+    require_free_space "$path"
+done
+
 echo "[*] Installing system dependencies..."
 sudo apt-get update -y
+# A dpkg run cut short (a full disk, a power loss, a killed
+# unattended-upgrades) leaves packages unconfigured or missing dependencies,
+# and apt-get install then refuses every package. Finish the configuration and
+# install the missing dependencies; --no-remove makes apt-get fail instead of
+# removing packages to get there.
+if ! sudo apt-get check >/dev/null 2>&1; then
+    echo "[*] Repairing interrupted package installs..."
+    sudo dpkg --configure -a
+    sudo apt-get install -f -y --no-remove
+fi
 sudo apt-get install -y jq curl gnupg lsb-release libarchive-tools pciutils
 
 sudo usermod -aG systemd-journal "$SERVICE_USER"
