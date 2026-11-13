@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.5.6-beta1
+# Kinesis Dynamo Bootstrap Script: v0.5.6-beta2
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -190,7 +190,9 @@ done
 sudo mkdir -p "$INSTALL_ROOT/mounts"
 sudo bsdtar -xvf "$RELEASE_ZIP" -C "$INSTALL_ROOT"
 sudo rm "$RELEASE_ZIP"
-sudo chown -R "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_ROOT"
+# The user's own group: it need not have the user's name.
+SERVICE_GROUP=$(id -gn "$SERVICE_USER")
+sudo chown -R "$SERVICE_USER":"$SERVICE_GROUP" "$INSTALL_ROOT"
 
 # --- 6. Initialization & Config ---
 # --init runs on every install, including re-installs. It is idempotent: each
@@ -667,6 +669,9 @@ if [ "$INSECURE" = "true" ]; then
 fi
 for svc in $DYNAMO_SERVICES; do
     sudo sed -i "s|User=ubuntu|User=$SERVICE_USER|g" "$INSTALL_ROOT/$svc"
+    # The firewall runs as root with the service user's group, which is
+    # what lets dynamo open its socket.
+    sudo sed -i "s|Group=ubuntu|Group=$SERVICE_GROUP|g" "$INSTALL_ROOT/$svc"
     sudo sed -i "s|/opt/dynamo/|$INSTALL_ROOT/|g" "$INSTALL_ROOT/$svc"
     sudo cp "$INSTALL_ROOT/$svc" /etc/systemd/system/
 done
