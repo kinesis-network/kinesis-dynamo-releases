@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.5.6-beta4
+# Kinesis Dynamo Bootstrap Script: v0.5.6-beta5
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -7,7 +7,6 @@ echo "--- Kinesis Dynamo Setup started at $(date) ---"
 # --- 1. Configuration ---
 # Set via environment (PROVISION_TOKEN is exported by the bootstrap script).
 PROVISION_TOKEN=${PROVISION_TOKEN:-""}
-UNIVERSE=${UNIVERSE:-"production"}
 RELEASE_VERSION=${RELEASE_VERSION:-"latest"}
 INSTALL_ROOT=${INSTALL_ROOT:-"/opt/dynamo"}
 SERVICE_USER=${SERVICE_USER:-"$USER"}
@@ -87,7 +86,6 @@ case "${OS_ARCH}" in
 esac
 
 echo "PROVISION_TOKEN=$PROVISION_TOKEN"
-echo "UNIVERSE=$UNIVERSE"
 echo "RELEASE_VERSION=$RELEASE_VERSION"
 echo "INSTALL_ROOT=$INSTALL_ROOT"
 echo "SERVICE_USER=$SERVICE_USER"
@@ -219,7 +217,7 @@ OOBE_ARG=""
 [ "$OOBE" = "true" ] && OOBE_ARG="--oobe"
 ONLINE_ARG=""
 [ "$ONLINE" = "true" ] && ONLINE_ARG="--online"
-sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --universe="${UNIVERSE}" --public-ip="${PUBLIC_IP}" --enable-dynamo="${ENABLE_DYNAMO}" --grpc-bind="${GRPC_BIND}" --install-sentinel="${INSTALL_SENTINEL}" $TEST_ARG $INSECURE_ARG $OOBE_ARG $ONLINE_ARG
+sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --public-ip="${PUBLIC_IP}" --enable-dynamo="${ENABLE_DYNAMO}" --grpc-bind="${GRPC_BIND}" --install-sentinel="${INSTALL_SENTINEL}" $TEST_ARG $INSECURE_ARG $OOBE_ARG $ONLINE_ARG
 
 # The posture init recorded -- from ENABLE_DYNAMO, the marker a previous run
 # left, or the redeemed token's initial_state -- decides whether the container
