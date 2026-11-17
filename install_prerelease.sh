@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.5.8-beta1
+# Kinesis Dynamo Bootstrap Script: v0.5.8-beta2
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -798,23 +798,28 @@ elif [ -f "$PROXY_DIR/proxy.env" ]; then
     # the container recreate below picks it up unchanged from the mount. The
     # one overwrite that remains keeps a timestamped copy, since the DPA's own
     # backups live inside the container and do not survive `docker rm`.
-    curl -fsSL "$NODE_PROXY_RAW_BASE/dataplaneapi.yml" -o /tmp/dataplaneapi.yml
-    sudo cp /tmp/dataplaneapi.yml "$MOUNT_DIR/dataplaneapi.yml"
+    # Downloads go to a fresh directory, not fixed /tmp names: a file another
+    # user left in /tmp cannot be overwritten (sticky bit, fs.protected_regular),
+    # and curl then fails with "(23) client returned ERROR on write".
+    PROXY_TMP=$(mktemp -d)
+    curl -fsSL "$NODE_PROXY_RAW_BASE/dataplaneapi.yml" -o "$PROXY_TMP/dataplaneapi.yml"
+    sudo cp "$PROXY_TMP/dataplaneapi.yml" "$MOUNT_DIR/dataplaneapi.yml"
     if [ -n "$PROVISION_TOKEN" ] || [ ! -f "$MOUNT_DIR/haproxy.cfg" ]; then
         if [ -f "$MOUNT_DIR/haproxy.cfg" ]; then
             BACKUP="$MOUNT_DIR/haproxy.cfg.bak-$(date -u +%Y%m%dT%H%M%SZ)"
             sudo cp "$MOUNT_DIR/haproxy.cfg" "$BACKUP"
             echo "[*] Re-provisioning: previous haproxy.cfg saved as $BACKUP"
         fi
-        curl -fsSL "$NODE_PROXY_RAW_BASE/haproxy.cfg.template" -o /tmp/haproxy.cfg.template
+        curl -fsSL "$NODE_PROXY_RAW_BASE/haproxy.cfg.template" -o "$PROXY_TMP/haproxy.cfg.template"
         sed -e "s|@ADMIN_HOST@|${ADMIN_HOST}|g" \
             -e "s|@MGMT_USERNAME@|${MGMT_USERNAME}|g" \
             -e "s|@MGMT_PASSWORD@|${MGMT_PASSWORD}|g" \
-            /tmp/haproxy.cfg.template | sudo tee "$MOUNT_DIR/haproxy.cfg" >/dev/null
+            "$PROXY_TMP/haproxy.cfg.template" | sudo tee "$MOUNT_DIR/haproxy.cfg" >/dev/null
         echo "[*] Rendered $MOUNT_DIR/haproxy.cfg from the template"
     else
         echo "[*] Keeping the existing $MOUNT_DIR/haproxy.cfg (live DPA config)"
     fi
+    rm -rf "$PROXY_TMP"
 
     echo "[*] Starting node-proxy container ($NODE_PROXY_IMAGE)..."
     sudo docker rm -f node-proxy >/dev/null 2>&1 || true
