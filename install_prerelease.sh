@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.5.7-beta1
+# Kinesis Dynamo Bootstrap Script: v0.5.8-beta1
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -66,6 +66,8 @@ SENTINEL_CONTAINER="kinesis-sentinel"
 # normal node this is empty/unused). PUBLIC_IP is passed through to `noded
 # --init`, which pre-registers the proxy and writes a bundle to $PROXY_DIR. The
 # proxy pool is not an input: the managers know it from the token.
+# NODE_PROXY_IMAGE is the image when the runtime-manager names none; the
+# bundle sets it (RM param NodeProxyContainerSource).
 PUBLIC_IP=${PUBLIC_IP:-""}
 PROXY_DIR="$INSTALL_ROOT/proxy"
 NODE_PROXY_IMAGE=${NODE_PROXY_IMAGE:-"kinesisorg/node-proxy"}
@@ -752,7 +754,8 @@ if [ -f "$PROXY_DIR/proxy.env" ] && [ "$DOCKER_RUNNING" = false ]; then
 elif [ -f "$PROXY_DIR/proxy.env" ]; then
     echo "[*] App proxy detected; setting up node-proxy container..."
     # proxy.env: ADMIN_HOST, MGMT_USERNAME, MGMT_PASSWORD, REDIS_ADDRS,
-    # REDIS_MASTER_NAME, REDIS_PASSWORD, CACERT_BASE64, CERT_FILE
+    # REDIS_MASTER_NAME, REDIS_PASSWORD, CACERT_BASE64, CERT_FILE, and
+    # NODE_PROXY_IMAGE when the runtime-manager names one
     . "$PROXY_DIR/proxy.env"
 
     MOUNT_DIR="$PROXY_DIR/mount"
@@ -813,7 +816,7 @@ elif [ -f "$PROXY_DIR/proxy.env" ]; then
         echo "[*] Keeping the existing $MOUNT_DIR/haproxy.cfg (live DPA config)"
     fi
 
-    echo "[*] Starting node-proxy container..."
+    echo "[*] Starting node-proxy container ($NODE_PROXY_IMAGE)..."
     sudo docker rm -f node-proxy >/dev/null 2>&1 || true
     sudo docker run -d --name node-proxy \
         --network=host --restart=always --pull=always \
