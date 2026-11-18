@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.5.8-beta2
+# Kinesis Dynamo Bootstrap Script: v0.5.8-beta3
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -749,8 +749,15 @@ fi
 # `noded --init` writes a bootstrap bundle ($PROXY_DIR/proxy.env) only when the
 # provisioning token is a proxy token. When present, stand up the node-proxy
 # container and activate the load balancer before starting the dynamo service.
+# A node-proxy container labeled network.kinesis.role=app-proxy was set up by
+# Stator's AppProxy order, from the runtime manager's GetAppProxyBundle; it is
+# Stator's to keep, so this setup (the older bundle) leaves it alone.
 if [ -f "$PROXY_DIR/proxy.env" ] && [ "$DOCKER_RUNNING" = false ]; then
     echo "[!] App proxy detected, but Docker is not running; node-proxy not started"
+elif [ -f "$PROXY_DIR/proxy.env" ] && [ -n "$(sudo docker ps -aq \
+        --filter name=^node-proxy$ \
+        --filter label=network.kinesis.role=app-proxy)" ]; then
+    echo "[*] App proxy detected; node-proxy is managed by Stator, left as is"
 elif [ -f "$PROXY_DIR/proxy.env" ]; then
     echo "[*] App proxy detected; setting up node-proxy container..."
     # proxy.env: ADMIN_HOST, MGMT_USERNAME, MGMT_PASSWORD, REDIS_ADDRS,
