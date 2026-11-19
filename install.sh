@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.5.9
+# Kinesis Dynamo Bootstrap Script: v0.5.10
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -64,14 +64,12 @@ SENTINEL_CONTAINER="kinesis-sentinel"
 
 # App-proxy provisioning (only used when PROVISION_TOKEN is a proxy token; for a
 # normal node this is empty/unused). PUBLIC_IP is passed through to `noded
-# --init`, which pre-registers the proxy and writes a bundle to $PROXY_DIR. The
-# proxy pool is not an input: the managers know it from the token.
-# NODE_PROXY_IMAGE is the image when the runtime-manager names none; the
-# bundle sets it (RM param NodeProxyContainerSource).
+# --init`, which pre-registers the proxy. The proxy pool is not an input: the
+# managers know it from the token. The node-proxy container is not set up
+# here: when a proxy token is redeemed, the Node Manager queues Stator's
+# AppProxy INSTALL order, and Stator sets the container up from the runtime
+# manager's GetAppProxyBundle and activates the load balancer.
 PUBLIC_IP=${PUBLIC_IP:-""}
-PROXY_DIR="$INSTALL_ROOT/proxy"
-NODE_PROXY_IMAGE=${NODE_PROXY_IMAGE:-"kinesisorg/node-proxy"}
-NODE_PROXY_RAW_BASE=${NODE_PROXY_RAW_BASE:-"https://raw.githubusercontent.com/kinesis-network/node-proxy/refs/heads/main/deploy"}
 
 # --- 2. Environment Detection ---
 IS_WSL=false
@@ -201,7 +199,7 @@ sudo chown -R "$SERVICE_USER":"$SERVICE_GROUP" "$INSTALL_ROOT"
 echo "[*] Running gRPC initialization..."
 # --public-ip is only meaningful for a proxy token; for a normal node it is
 # empty and init ignores it. For a proxy token, init also
-# pre-registers the proxy and writes the bundle to $PROXY_DIR.
+# pre-registers the proxy.
 TEST_ARG=""
 [ "$FOR_TEST" = "true" ] && TEST_ARG="--test"
 # The marker is the single source of truth for the firewall, written (or
@@ -583,10 +581,11 @@ fi
 # dockerd's, containerd's, dynamo's -- and the whole node freezes until a
 # reboot (dynamo #117). So app containers go in one slice capped at host RAM
 # minus a reserve for the host itself: the agent, the container runtime,
-# sshd, and the containers install.sh runs outside the slice (sentinel,
-# node-proxy). When the apps fill the slice, the kernel kills a container
-# inside it and the host stays up. Gateway containers are app containers here:
-# dynamo creates them through the same path, so they share the cap.
+# sshd, and the containers that run outside the slice (install.sh's
+# sentinel, Stator's node-proxy). When the apps fill the slice, the kernel
+# kills a container inside it and the host stays up. Gateway containers are
+# app containers here: dynamo creates them through the same path, so they
+# share the cap.
 #
 # Only a hard cap, no MemoryHigh: with no swap there is nothing to reclaim
 # from an app's anonymous memory, so above MemoryHigh the kernel only
@@ -651,8 +650,8 @@ fi
 
 fi # ENABLE_DYNAMO: end of the container-runtime setup
 
-# What runs containers below -- node-proxy, the sentinel, dynamo -- is not
-# started without Docker.
+# What runs containers below -- the sentinel, dynamo -- is not started
+# without Docker.
 DOCKER_RUNNING=false
 systemctl is-active --quiet docker && DOCKER_RUNNING=true
 
@@ -721,9 +720,8 @@ elif [ "$ENABLE_DYNAMO" = false ]; then
     sudo systemctl enable "$STATOR_SERVICE"
     sudo systemctl disable $CORE_SERVICES 2>/dev/null || true
 else
-    # Enable the units, but don't start them yet: app-proxy nodes must bring up
-    # the node-proxy container first, and starting the dynamo service (which
-    # performs RegisterNode) is the last step for both node kinds.
+    # Enable the units, but don't start them yet: starting the dynamo service
+    # (which performs RegisterNode) is the last step.
     sudo systemctl enable "$STATOR_SERVICE"
     sudo systemctl enable $CORE_SERVICES
 fi
@@ -745,129 +743,12 @@ else
     sudo systemctl disable --now "$FIREWALL_SERVICE"
 fi
 
-# --- 7b. App proxy setup ---
-# `noded --init` writes a bootstrap bundle ($PROXY_DIR/proxy.env) only when the
-# provisioning token is a proxy token. When present, stand up the node-proxy
-# container and activate the load balancer before starting the dynamo service.
-# A node-proxy container labeled network.kinesis.role=app-proxy was set up by
-# Stator's AppProxy order, from the runtime manager's GetAppProxyBundle; it is
-# Stator's to keep, so this setup (the older bundle) leaves it alone.
-if [ -f "$PROXY_DIR/proxy.env" ] && [ "$DOCKER_RUNNING" = false ]; then
-    echo "[!] App proxy detected, but Docker is not running; node-proxy not started"
-elif [ -f "$PROXY_DIR/proxy.env" ] && [ -n "$(sudo docker ps -aq \
-        --filter name=^node-proxy$ \
-        --filter label=network.kinesis.role=app-proxy)" ]; then
-    echo "[*] App proxy detected; node-proxy is managed by Stator, left as is"
-elif [ -f "$PROXY_DIR/proxy.env" ]; then
-    echo "[*] App proxy detected; setting up node-proxy container..."
-    # proxy.env: ADMIN_HOST, MGMT_USERNAME, MGMT_PASSWORD, REDIS_ADDRS,
-    # REDIS_MASTER_NAME, REDIS_PASSWORD, CACERT_BASE64, CERT_FILE, and
-    # NODE_PROXY_IMAGE when the runtime-manager names one
-    . "$PROXY_DIR/proxy.env"
-
-    MOUNT_DIR="$PROXY_DIR/mount"
-    CERTS_DIR="$PROXY_DIR/certs"
-    # On-disk name for the shared wildcard. Matches what the Data Plane API writes
-    # on rotation (it sanitizes dots to underscores), so a renewal overwrites it.
-    WILDCARD_CERT_FILE="star_apps_kinesiscloud_com.pem"
-
-    sudo mkdir -p "$CERTS_DIR" "$MOUNT_DIR" "$PROXY_DIR/general" "$PROXY_DIR/logs"
-
-    # The installed wildcard has two writers: the bundle here, and the runtime
-    # manager's cert distribution, which rewrites the same file through the Data
-    # Plane API on every renewal. `noded --init` above refreshes the bundle from
-    # the manager on every run, but that refresh is best-effort, and a proxy from
-    # an older release still carries its provision-time bundle. Installing that
-    # over a renewed cert rolled proxies back to an expired wildcard on
-    # self-upgrade (2026-08-09), invisibly to the manager, which only tracks its
-    # own uploads. So the bundle is installed only when it outlives what is on
-    # disk; a file that does not parse counts as expired.
-    cert_not_after() {
-        local end
-        end=$(sudo openssl x509 -noout -enddate -in "$1" 2>/dev/null | cut -d= -f2)
-        [ -n "$end" ] && date -d "$end" +%s 2>/dev/null || echo 0
-    }
-    BUNDLE_NOT_AFTER=$(cert_not_after "$PROXY_DIR/$CERT_FILE")
-    INSTALLED_NOT_AFTER=$(cert_not_after "$CERTS_DIR/$WILDCARD_CERT_FILE")
-    if [ "$BUNDLE_NOT_AFTER" -gt "$INSTALLED_NOT_AFTER" ]; then
-        echo "[*] Installing the wildcard cert from the bundle (expires $(date -u -d @"$BUNDLE_NOT_AFTER" +%FT%TZ))"
-        sudo cp "$PROXY_DIR/$CERT_FILE" "$CERTS_DIR/$WILDCARD_CERT_FILE"
-    else
-        echo "[*] Keeping the installed wildcard cert (expires $(date -u -d @"$INSTALLED_NOT_AFTER" +%FT%TZ)); the bundle's is not newer"
-    fi
-
-    # dataplaneapi.yml is static and always refreshed. haproxy.cfg is NOT: the
-    # mounted file is the DataPlane API's live config (dataplaneapi.yml
-    # config_file), i.e. where every frontend/backend the managers ever pushed
-    # to this LB is persisted. It is rendered from the template only on a fresh
-    # provision (token given, so proxy.env and its DPA password are new) or
-    # when it does not exist yet; a re-run (self-upgrade) leaves it alone, and
-    # the container recreate below picks it up unchanged from the mount. The
-    # one overwrite that remains keeps a timestamped copy, since the DPA's own
-    # backups live inside the container and do not survive `docker rm`.
-    # Downloads go to a fresh directory, not fixed /tmp names: a file another
-    # user left in /tmp cannot be overwritten (sticky bit, fs.protected_regular),
-    # and curl then fails with "(23) client returned ERROR on write".
-    PROXY_TMP=$(mktemp -d)
-    curl -fsSL "$NODE_PROXY_RAW_BASE/dataplaneapi.yml" -o "$PROXY_TMP/dataplaneapi.yml"
-    sudo cp "$PROXY_TMP/dataplaneapi.yml" "$MOUNT_DIR/dataplaneapi.yml"
-    if [ -n "$PROVISION_TOKEN" ] || [ ! -f "$MOUNT_DIR/haproxy.cfg" ]; then
-        if [ -f "$MOUNT_DIR/haproxy.cfg" ]; then
-            BACKUP="$MOUNT_DIR/haproxy.cfg.bak-$(date -u +%Y%m%dT%H%M%SZ)"
-            sudo cp "$MOUNT_DIR/haproxy.cfg" "$BACKUP"
-            echo "[*] Re-provisioning: previous haproxy.cfg saved as $BACKUP"
-        fi
-        curl -fsSL "$NODE_PROXY_RAW_BASE/haproxy.cfg.template" -o "$PROXY_TMP/haproxy.cfg.template"
-        sed -e "s|@ADMIN_HOST@|${ADMIN_HOST}|g" \
-            -e "s|@MGMT_USERNAME@|${MGMT_USERNAME}|g" \
-            -e "s|@MGMT_PASSWORD@|${MGMT_PASSWORD}|g" \
-            "$PROXY_TMP/haproxy.cfg.template" | sudo tee "$MOUNT_DIR/haproxy.cfg" >/dev/null
-        echo "[*] Rendered $MOUNT_DIR/haproxy.cfg from the template"
-    else
-        echo "[*] Keeping the existing $MOUNT_DIR/haproxy.cfg (live DPA config)"
-    fi
-    rm -rf "$PROXY_TMP"
-
-    echo "[*] Starting node-proxy container ($NODE_PROXY_IMAGE)..."
-    sudo docker rm -f node-proxy >/dev/null 2>&1 || true
-    sudo docker run -d --name node-proxy \
-        --network=host --restart=always --pull=always \
-        -e ACME_SOCKET=/tmp/acme-sidecar.sock \
-        -e REDIS_ADDRS="$REDIS_ADDRS" \
-        -e REDIS_MASTER_NAME="$REDIS_MASTER_NAME" \
-        -e REDIS_PASSWORD="$REDIS_PASSWORD" \
-        -e CACERT_BASE64="$CACERT_BASE64" \
-        -v "$CERTS_DIR:/etc/haproxy/certs" \
-        -v "$MOUNT_DIR:/etc/haproxy/mount" \
-        -v "$PROXY_DIR/general:/etc/haproxy/general" \
-        -v "$PROXY_DIR/logs:/var/log/haproxy" \
-        "$NODE_PROXY_IMAGE"
-
-    echo "[*] Waiting for DataplaneAPI..."
-    DPA_HEALTHY=false
-    for _ in $(seq 1 30); do
-        if curl -fsS -u "$MGMT_USERNAME:$MGMT_PASSWORD" \
-             http://localhost:5555/v3/services/haproxy/runtime/info >/dev/null 2>&1; then
-            DPA_HEALTHY=true
-            break
-        fi
-        sleep 2
-    done
-
-    if [ "$DPA_HEALTHY" = true ]; then
-        echo "[*] Post-registering app proxy (activating load balancer)..."
-        sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --postreg --config="$CONFIG_PATH" $INSECURE_ARG
-    else
-        echo "[WARN] DataplaneAPI did not become healthy; skipping activation (LB stays pending)."
-    fi
-fi
-
-# --- 7c. Sentinel (Tetragon) ---
+# --- 7b. Sentinel (Tetragon) ---
 # `noded --init` leaves sentinel.enabled only on a dynamo node that asked for
 # the sentinel, and has already pointed plugins.docker.tetragon_addr in
 # config.json at the socket the container serves under /var/run/tetragon. The
 # container is recreated on every run so a re-install picks up the latest
-# image, as node-proxy is. It starts before dynamo, whose tetragon stream
+# image. It starts before dynamo, whose tetragon stream
 # retries until the socket is up either way. SOCKET_GID has the container's
 # entrypoint chown the socket to root:<service user's group>, mode 660: the
 # Tetragon API is unauthenticated and can load enforcer policies, so it is
