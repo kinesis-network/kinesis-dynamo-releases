@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.5.7
+# Kinesis Dynamo Bootstrap Script: v0.5.8
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -66,6 +66,8 @@ SENTINEL_CONTAINER="kinesis-sentinel"
 # normal node this is empty/unused). PUBLIC_IP is passed through to `noded
 # --init`, which pre-registers the proxy and writes a bundle to $PROXY_DIR. The
 # proxy pool is not an input: the managers know it from the token.
+# NODE_PROXY_IMAGE is the image when the runtime-manager names none; the
+# bundle sets it (RM param NodeProxyContainerSource).
 PUBLIC_IP=${PUBLIC_IP:-""}
 PROXY_DIR="$INSTALL_ROOT/proxy"
 NODE_PROXY_IMAGE=${NODE_PROXY_IMAGE:-"kinesisorg/node-proxy"}
@@ -747,12 +749,20 @@ fi
 # `noded --init` writes a bootstrap bundle ($PROXY_DIR/proxy.env) only when the
 # provisioning token is a proxy token. When present, stand up the node-proxy
 # container and activate the load balancer before starting the dynamo service.
+# A node-proxy container labeled network.kinesis.role=app-proxy was set up by
+# Stator's AppProxy order, from the runtime manager's GetAppProxyBundle; it is
+# Stator's to keep, so this setup (the older bundle) leaves it alone.
 if [ -f "$PROXY_DIR/proxy.env" ] && [ "$DOCKER_RUNNING" = false ]; then
     echo "[!] App proxy detected, but Docker is not running; node-proxy not started"
+elif [ -f "$PROXY_DIR/proxy.env" ] && [ -n "$(sudo docker ps -aq \
+        --filter name=^node-proxy$ \
+        --filter label=network.kinesis.role=app-proxy)" ]; then
+    echo "[*] App proxy detected; node-proxy is managed by Stator, left as is"
 elif [ -f "$PROXY_DIR/proxy.env" ]; then
     echo "[*] App proxy detected; setting up node-proxy container..."
     # proxy.env: ADMIN_HOST, MGMT_USERNAME, MGMT_PASSWORD, REDIS_ADDRS,
-    # REDIS_MASTER_NAME, REDIS_PASSWORD, CACERT_BASE64, CERT_FILE
+    # REDIS_MASTER_NAME, REDIS_PASSWORD, CACERT_BASE64, CERT_FILE, and
+    # NODE_PROXY_IMAGE when the runtime-manager names one
     . "$PROXY_DIR/proxy.env"
 
     MOUNT_DIR="$PROXY_DIR/mount"
@@ -795,25 +805,30 @@ elif [ -f "$PROXY_DIR/proxy.env" ]; then
     # the container recreate below picks it up unchanged from the mount. The
     # one overwrite that remains keeps a timestamped copy, since the DPA's own
     # backups live inside the container and do not survive `docker rm`.
-    curl -fsSL "$NODE_PROXY_RAW_BASE/dataplaneapi.yml" -o /tmp/dataplaneapi.yml
-    sudo cp /tmp/dataplaneapi.yml "$MOUNT_DIR/dataplaneapi.yml"
+    # Downloads go to a fresh directory, not fixed /tmp names: a file another
+    # user left in /tmp cannot be overwritten (sticky bit, fs.protected_regular),
+    # and curl then fails with "(23) client returned ERROR on write".
+    PROXY_TMP=$(mktemp -d)
+    curl -fsSL "$NODE_PROXY_RAW_BASE/dataplaneapi.yml" -o "$PROXY_TMP/dataplaneapi.yml"
+    sudo cp "$PROXY_TMP/dataplaneapi.yml" "$MOUNT_DIR/dataplaneapi.yml"
     if [ -n "$PROVISION_TOKEN" ] || [ ! -f "$MOUNT_DIR/haproxy.cfg" ]; then
         if [ -f "$MOUNT_DIR/haproxy.cfg" ]; then
             BACKUP="$MOUNT_DIR/haproxy.cfg.bak-$(date -u +%Y%m%dT%H%M%SZ)"
             sudo cp "$MOUNT_DIR/haproxy.cfg" "$BACKUP"
             echo "[*] Re-provisioning: previous haproxy.cfg saved as $BACKUP"
         fi
-        curl -fsSL "$NODE_PROXY_RAW_BASE/haproxy.cfg.template" -o /tmp/haproxy.cfg.template
+        curl -fsSL "$NODE_PROXY_RAW_BASE/haproxy.cfg.template" -o "$PROXY_TMP/haproxy.cfg.template"
         sed -e "s|@ADMIN_HOST@|${ADMIN_HOST}|g" \
             -e "s|@MGMT_USERNAME@|${MGMT_USERNAME}|g" \
             -e "s|@MGMT_PASSWORD@|${MGMT_PASSWORD}|g" \
-            /tmp/haproxy.cfg.template | sudo tee "$MOUNT_DIR/haproxy.cfg" >/dev/null
+            "$PROXY_TMP/haproxy.cfg.template" | sudo tee "$MOUNT_DIR/haproxy.cfg" >/dev/null
         echo "[*] Rendered $MOUNT_DIR/haproxy.cfg from the template"
     else
         echo "[*] Keeping the existing $MOUNT_DIR/haproxy.cfg (live DPA config)"
     fi
+    rm -rf "$PROXY_TMP"
 
-    echo "[*] Starting node-proxy container..."
+    echo "[*] Starting node-proxy container ($NODE_PROXY_IMAGE)..."
     sudo docker rm -f node-proxy >/dev/null 2>&1 || true
     sudo docker run -d --name node-proxy \
         --network=host --restart=always --pull=always \
