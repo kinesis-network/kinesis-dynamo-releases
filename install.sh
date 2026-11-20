@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.5.11
+# Kinesis Dynamo Bootstrap Script: v0.5.12
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -64,11 +64,12 @@ SENTINEL_CONTAINER="kinesis-sentinel"
 
 # App-proxy provisioning (only used when PROVISION_TOKEN is a proxy token; for a
 # normal node this is empty/unused). PUBLIC_IP is passed through to `noded
-# --init`, which pre-registers the proxy. The proxy pool is not an input: the
-# managers know it from the token. The node-proxy container is not set up
-# here: when a proxy token is redeemed, the Node Manager queues Stator's
-# AppProxy INSTALL order, and Stator sets the container up from the runtime
-# manager's GetAppProxyBundle and activates the load balancer.
+# --init`, which records it for Stator. The proxy pool is not an input: the
+# managers know it from the token. The proxy is not set up here: when a proxy
+# token is redeemed, the Node Manager queues Stator's AppProxy INSTALL order,
+# and Stator registers the proxy with the runtime manager's
+# GetAppProxyBundle, sets up the node-proxy container and activates the load
+# balancer.
 PUBLIC_IP=${PUBLIC_IP:-""}
 
 # --- 2. Environment Detection ---
@@ -198,15 +199,13 @@ sudo chown -R "$SERVICE_USER":"$SERVICE_GROUP" "$INSTALL_ROOT"
 # keeps its wallet and config and only has derived state reconciled.
 echo "[*] Running gRPC initialization..."
 # --public-ip is only meaningful for a proxy token; for a normal node it is
-# empty and init ignores it. For a proxy token, init also
-# pre-registers the proxy.
+# empty. init records it for Stator, which registers the proxy with it.
 TEST_ARG=""
 [ "$FOR_TEST" = "true" ] && TEST_ARG="--test"
 # The marker is the single source of truth for the firewall, written (or
-# removed) by `noded --init` when it redeems a token (and dropped on an app
-# proxy from an older release), and reconciled into plugins.docker.firewall_addr
-# in config.json on every init. Below it only decides whether the systemd unit
-# runs.
+# removed) by `noded --init` when it redeems a token, and reconciled into
+# plugins.docker.firewall_addr in config.json on every init. Below it only
+# decides whether the systemd unit runs.
 FIREWALL_MARKER="${INSTALL_ROOT}/firewall.enabled"
 INSECURE_ARG=""
 if [ "$INSECURE" = "true" ]; then
