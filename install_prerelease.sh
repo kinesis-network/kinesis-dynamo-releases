@@ -1,5 +1,5 @@
 #!/bin/sh
-# Kinesis Dynamo Bootstrap Script: v0.5.10-beta1
+# Kinesis Dynamo Bootstrap Script: v0.5.14-beta1
 set -e # Exit on error
 
 echo "--- Kinesis Dynamo Setup started at $(date) ---"
@@ -61,15 +61,6 @@ CONTAINERD_ROOT=${CONTAINERD_ROOT:-""}
 INSTALL_SENTINEL=${INSTALL_SENTINEL:-""}
 SENTINEL_IMAGE=${SENTINEL_IMAGE:-"kinesisorg/kinesis-sentinel"}
 SENTINEL_CONTAINER="kinesis-sentinel"
-
-# App-proxy provisioning (only used when PROVISION_TOKEN is a proxy token; for a
-# normal node this is empty/unused). PUBLIC_IP is passed through to `noded
-# --init`, which pre-registers the proxy. The proxy pool is not an input: the
-# managers know it from the token. The node-proxy container is not set up
-# here: when a proxy token is redeemed, the Node Manager queues Stator's
-# AppProxy INSTALL order, and Stator sets the container up from the runtime
-# manager's GetAppProxyBundle and activates the load balancer.
-PUBLIC_IP=${PUBLIC_IP:-""}
 
 # --- 2. Environment Detection ---
 IS_WSL=false
@@ -197,16 +188,12 @@ sudo chown -R "$SERVICE_USER":"$SERVICE_GROUP" "$INSTALL_ROOT"
 # step decides for itself whether it applies, so an already-provisioned node
 # keeps its wallet and config and only has derived state reconciled.
 echo "[*] Running gRPC initialization..."
-# --public-ip is only meaningful for a proxy token; for a normal node it is
-# empty and init ignores it. For a proxy token, init also
-# pre-registers the proxy.
 TEST_ARG=""
 [ "$FOR_TEST" = "true" ] && TEST_ARG="--test"
 # The marker is the single source of truth for the firewall, written (or
-# removed) by `noded --init` when it redeems a token (and dropped on an app
-# proxy from an older release), and reconciled into plugins.docker.firewall_addr
-# in config.json on every init. Below it only decides whether the systemd unit
-# runs.
+# removed) by `noded --init` when it redeems a token, and reconciled into
+# plugins.docker.firewall_addr in config.json on every init. Below it only
+# decides whether the systemd unit runs.
 FIREWALL_MARKER="${INSTALL_ROOT}/firewall.enabled"
 INSECURE_ARG=""
 if [ "$INSECURE" = "true" ]; then
@@ -217,7 +204,7 @@ OOBE_ARG=""
 [ "$OOBE" = "true" ] && OOBE_ARG="--oobe"
 ONLINE_ARG=""
 [ "$ONLINE" = "true" ] && ONLINE_ARG="--online"
-sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --public-ip="${PUBLIC_IP}" --enable-dynamo="${ENABLE_DYNAMO}" --grpc-bind="${GRPC_BIND}" --install-sentinel="${INSTALL_SENTINEL}" $TEST_ARG $INSECURE_ARG $OOBE_ARG $ONLINE_ARG
+sudo -u "$SERVICE_USER" "${INSTALL_ROOT}/noded" --init="${PROVISION_TOKEN}" --root="${INSTALL_ROOT}" --enable-dynamo="${ENABLE_DYNAMO}" --grpc-bind="${GRPC_BIND}" --install-sentinel="${INSTALL_SENTINEL}" $TEST_ARG $INSECURE_ARG $OOBE_ARG $ONLINE_ARG
 
 # The posture init recorded -- from ENABLE_DYNAMO, the marker a previous run
 # left, or the redeemed token's initial_state -- decides whether the container
@@ -654,9 +641,6 @@ fi # ENABLE_DYNAMO: end of the container-runtime setup
 # without Docker.
 DOCKER_RUNNING=false
 systemctl is-active --quiet docker && DOCKER_RUNNING=true
-
-# The cloud provider (csp, csp_region, csp_zone) and grpc_bind are recorded by
-# `noded --init` above.
 
 # --- 7. Systemd Integration ---
 echo "[*] Configuring systemd services..."
